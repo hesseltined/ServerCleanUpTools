@@ -10,9 +10,13 @@ After a successful run, settings are written to **`Archive-OldFiles.config.json`
 
 On a **file server**, when you are prompted for paths (not when all paths are passed on the command line), the script lists **published SMB disk shares** (via `Win32_Share`) so you can pick the **input** share, or **Other** to type a path. The **archive** location defaults to the local path of the share named **`Archive`** (change with `-ArchiveShareName`). If that share does not exist, you are prompted for the full archive folder path. Use **`-SkipShareMenu`** to disable the share picker and use plain prompts only.
 
-Age is judged by **last write time** by default (Explorer “Date modified”). After a **copy or restore**, that date can be recent even when the file is old; use **`-AgeBasis CreationTime`** or **`-AgeBasis Earliest`** (older of creation vs last write) to match what you expect. Enumeration uses **`-Force`** so hidden/system files are included.
+**`-All`** runs a **preview-only** pass over **every** published disk share (same filter as the picker: Type 0, no trailing `$` in the name). **`-Commit` is ignored** (no moves). Pass **`ArchivePath`** and **`Years`** (or use saved config); **HTML** reports are written **one file per share** under the archive folder. Shares whose path **contains** the archive folder are skipped.
 
-The **`param`** block is **minimal** (no `[Parameter]`, no `[switch]`) with validation in script (v1.3.0+) so Windows PowerShell does not fail with **argument types do not match** at bind time on some hosts.
+Age is judged by **last write time** by default (Explorer “Date modified”). You can use **`-AgeBasis LastAccessTime`** (last opened / NTFS last access; note that last-access updates can be disabled on a volume), **`-AgeBasis LatestWriteOrAccess`** (newer of modified and last access—only archives when both are older than the cutoff), **`-AgeBasis CreationTime`**, or **`-AgeBasis Earliest`** (older of creation vs last write, useful after copies/restores). Aliases include **Modified**, **Opened**, **ModifiedOrOpened**, and **A** / **B** / **C**. Enumeration uses **`-Force`** so hidden/system files are included.
+
+In reports, owners that are unresolved SIDs or deleted accounts show as **No active user**.
+
+The **`param`** block stays **mostly untyped** (avoids bind-time type mismatches on some hosts); **`[switch]$All`** is an exception so **`-All`** needs no value. Other validation runs after binding.
 
 - **Requirements:** Windows PowerShell 5.1+
 - **Documentation / download page:** [technologist.services/tools/archive-files/](https://technologist.services/tools/archive-files/)
@@ -23,6 +27,7 @@ The **`param`** block is **minimal** (no `[Parameter]`, no `[switch]`) with vali
 - **Execution policy:** `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Archive-OldFiles.ps1` (add `-InputPath`, `-ArchivePath`, `-Years`), or `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
 - **Wrong extension:** Ensure the file is `Archive-OldFiles.ps1`, not `.ps1.txt`
 - **Get-Help:** From the script folder: `Get-Help .\Archive-OldFiles.ps1 -Full`
+- **`-All` “Missing an argument”:** Use a build **v1.7.1+** (switch parameter). On very old copies you could use `-All:$true`.
 
 ## Repository
 

@@ -7,12 +7,15 @@
     Use -Commit to perform moves. With -Commit, the archive folder is created if it does not exist.
     The archive path must not be inside the input tree. Preview mode requires the archive folder to already exist.
 
-    Age uses LastWriteTime by default (Explorer "Date modified"). Use -AgeBasis CreationTime for "Date created",
-    or Earliest for the older of the two (useful after copies/restores that refresh LastWriteTime).
+    Age uses LastWriteTime by default (Explorer "Date modified"). Other -AgeBasis values: LastAccessTime (last
+    opened / NTFS last access; may be inaccurate if the volume disables last-access updates), LatestWriteOrAccess
+    (newer of modified and last access, so a file is old only if both are before the cutoff), CreationTime, Earliest
+    (older of creation vs last write; useful after copies/restores that refresh LastWriteTime).
 
     After a successful run, settings are saved to Archive-OldFiles.config.json next to the script (unless -NoSaveConfig).
     Each run also appends a short summary to Archive-OldFiles.run.log in the same folder (unless -NoRunLog).
     Optional HTML reports are written under the archive path; the file name includes computer/AD domain, the scanned path, and a timestamp.
+    Use -All on a file server to preview every published folder share (HTML per share, never -Commit). Owner column resolves SIDs; unresolved or deleted accounts show as "No active user".
 
 .PARAMETER InputPath
     Root folder to scan recursively. Optional if a valid saved config exists.
@@ -46,17 +49,24 @@
     Do not show the published-share picker for InputPath; use prompts or parameters only.
 
 .PARAMETER AgeBasis
-    Which timestamp to compare to the cutoff: LastWriteTime (default), CreationTime, or Earliest (older of the two).
+    Timestamp compared to the cutoff: LastWriteTime (default, last modified); LastAccessTime (last accessed / opened);
+    LatestWriteOrAccess (newer of last modified and last access); CreationTime; Earliest (older of creation vs modified).
+    Aliases: Modified, Opened, LastOpened, ModifiedOrOpened, A/B/C (see Get-Help examples).
 
 .PARAMETER NoRunLog
     Do not append a line to Archive-OldFiles.run.log next to the config file.
+
+.PARAMETER All
+    Scan every published disk share on this computer (same rules as the share picker: Type 0, no trailing $ in name).
+    Always runs in preview mode: no moves are performed even if -Commit or saved JSON says commit. Implies HTML output:
+    one report file per share under ArchivePath. InputPath is ignored. Requires ArchivePath and Years (from parameters or saved config).
 
 .NOTES
     Purpose: Age-based archival of old files to a separate archive location.
     Author: Doug Hesseltine
     Created: 2026-03-27
-    Modified: 2026-03-27
-    Version: 1.5.4
+    Modified: 2026-03-28
+    Version: 1.7.2
 
     Troubleshooting (if the script will not run):
     - After downloading from the web, run: Unblock-File -Path .\Archive-OldFiles.ps1
@@ -64,6 +74,7 @@
     - Ensure the file is named Archive-OldFiles.ps1 (not .txt). Open in Notepad and Save As, Encoding: UTF-8 if you see odd characters.
     - Settings: Archive-OldFiles.config.json next to the script. Run summary: Archive-OldFiles.run.log (same folder). HTML reports: archive root when you choose HTML.
     - ParserError (Unexpected token '}') after editing: replace the file with a full fresh copy from source; truncated saves break the script mid-block.
+    - -All: use -All with no value (switch). Older copies used an untyped -All parameter and required -All:$true; update to v1.7.1+.
 
 .LINK
     https://technologist.services/tools/archive-files/
@@ -85,7 +96,17 @@
 .EXAMPLE
     .\Archive-OldFiles.ps1 -InputPath 'D:\Data' -ArchivePath '\\nas\archive' -Years 7 -AgeBasis Earliest
 
-    Treats a file as old if EITHER last write or creation is older than the threshold (common after file copies).
+    Uses the older of creation time and last write (common after file copies that refresh modified date).
+
+.EXAMPLE
+    .\Archive-OldFiles.ps1 -InputPath 'D:\Data' -ArchivePath '\\nas\archive' -Years 7 -AgeBasis LatestWriteOrAccess
+
+    A file is too new to archive if either last modified or last access is on or after the cutoff.
+
+.EXAMPLE
+    .\Archive-OldFiles.ps1 -All -ArchivePath 'D:\Reports\ArchivePreviews' -Years 7
+
+    Preview-only scan of all folder shares; writes one HTML report per share under the archive path (no -Commit).
 #>
 
 param(
@@ -100,7 +121,8 @@ param(
     $ArchiveShareName,
     $SkipShareMenu,
     $AgeBasis,
-    $NoRunLog
+    $NoRunLog,
+    [switch]$All
 )
 
 if ($PSVersionTable.PSVersion.Major -lt 5) {
@@ -143,7 +165,7 @@ function ConvertTo-BoundBool {
     return $false
 }
 
-# Defaults and validation after binding (minimal param block avoids binder type-mismatch errors).
+# Defaults and validation after binding. Param types are minimal except [switch]$All so -All works without a value (PS 5.1).
 if (-not $PSBoundParameters.ContainsKey('ArchiveShareName') -or [string]::IsNullOrWhiteSpace("$ArchiveShareName")) {
     $ArchiveShareName = 'Archive'
 }
@@ -180,21 +202,60 @@ if ($PSBoundParameters.ContainsKey('RemoveEmptyFolders') -and -not [string]::IsN
     }
 }
 
+function Normalize-AgeBasisParameter {
+    param([string]$abRaw)
+    if ([string]::IsNullOrWhiteSpace($abRaw)) {
+        return $null
+    }
+    $ab = $abRaw.Trim()
+    if ($ab -match '^(?i)lastwritetime$') {
+        return 'LastWriteTime'
+    }
+    if ($ab -match '^(?i)(lastmodified|modified)$') {
+        return 'LastWriteTime'
+    }
+    if ($ab -match '^(?i)a$') {
+        return 'LastWriteTime'
+    }
+    if ($ab -match '^(?i)lastaccesstime$') {
+        return 'LastAccessTime'
+    }
+    if ($ab -match '^(?i)(lastaccess|lastopened|opened)$') {
+        return 'LastAccessTime'
+    }
+    if ($ab -match '^(?i)b$') {
+        return 'LastAccessTime'
+    }
+    if ($ab -match '^(?i)latestwriteoraccess$') {
+        return 'LatestWriteOrAccess'
+    }
+    if ($ab -match '^(?i)(modifiedoropened|writeoraccess|latestactivity)$') {
+        return 'LatestWriteOrAccess'
+    }
+    if ($ab -match '^(?i)c$') {
+        return 'LatestWriteOrAccess'
+    }
+    if ($ab -match '^(?i)creationtime$') {
+        return 'CreationTime'
+    }
+    if ($ab -match '^(?i)earliest$') {
+        return 'Earliest'
+    }
+    return $null
+}
+
+function Resolve-AgeBasisFromString {
+    param([string]$Raw)
+    return (Normalize-AgeBasisParameter -abRaw $Raw)
+}
+
 $ageBasisEffective = 'LastWriteTime'
 if ($PSBoundParameters.ContainsKey('AgeBasis') -and -not [string]::IsNullOrWhiteSpace("$AgeBasis")) {
-    $ab = "$AgeBasis".Trim()
-    if ($ab -match '^(?i)lastwritetime$') {
-        $ageBasisEffective = 'LastWriteTime'
+    $nab = Normalize-AgeBasisParameter -abRaw "$AgeBasis"
+    if ($null -eq $nab) {
+        throw "-AgeBasis not recognized. Use LastWriteTime, LastAccessTime, LatestWriteOrAccess, CreationTime, Earliest (aliases: Modified, Opened, ModifiedOrOpened, A/B/C). Got: $AgeBasis"
     }
-    elseif ($ab -match '^(?i)creationtime$') {
-        $ageBasisEffective = 'CreationTime'
-    }
-    elseif ($ab -match '^(?i)earliest$') {
-        $ageBasisEffective = 'Earliest'
-    }
-    else {
-        throw "-AgeBasis must be LastWriteTime, CreationTime, or Earliest. Got: $AgeBasis"
-    }
+    $ageBasisEffective = $nab
 }
 
 # Parse Years as a number (also when set from positional $args, not only when bound by name).
@@ -210,10 +271,11 @@ if (-not [string]::IsNullOrWhiteSpace("$Years")) {
 $skipShareMenuFlag = ConvertTo-BoundBool $SkipShareMenu
 $noSaveConfigFlag = ConvertTo-BoundBool $NoSaveConfig
 $noRunLogFlag = ConvertTo-BoundBool $NoRunLog
+$allSharesFlag = $All.IsPresent
 
 $ErrorActionPreference = 'Stop'
 
-$script:Version = '1.5.4'
+$script:Version = '1.7.2'
 
 function Get-DefaultConfigPath {
     if ($PSScriptRoot) {
@@ -361,14 +423,17 @@ function Test-SingleConfigValidity {
         [string]$InputPath,
         [string]$ArchivePath,
         [double]$Years,
-        [bool]$DoCommit
+        [bool]$DoCommit,
+        [bool]$AllSharesMode = $false
     )
     $issues = @()
-    if ([string]::IsNullOrWhiteSpace("$InputPath")) {
-        $issues += @{ Field = 'InputPath'; Message = 'InputPath is empty.' }
-    }
-    elseif (-not (Test-Path -LiteralPath $InputPath)) {
-        $issues += @{ Field = 'InputPath'; Message = "InputPath does not exist: $InputPath" }
+    if (-not $AllSharesMode) {
+        if ([string]::IsNullOrWhiteSpace("$InputPath")) {
+            $issues += @{ Field = 'InputPath'; Message = 'InputPath is empty.' }
+        }
+        elseif (-not (Test-Path -LiteralPath $InputPath)) {
+            $issues += @{ Field = 'InputPath'; Message = "InputPath does not exist: $InputPath" }
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace("$ArchivePath")) {
@@ -468,24 +533,6 @@ function Get-RelativePathFromRoot {
     return $tail
 }
 
-function Resolve-AgeBasisFromString {
-    param([string]$Raw)
-    if ([string]::IsNullOrWhiteSpace($Raw)) {
-        return $null
-    }
-    $ab = $Raw.Trim()
-    if ($ab -match '^(?i)lastwritetime$') {
-        return 'LastWriteTime'
-    }
-    if ($ab -match '^(?i)creationtime$') {
-        return 'CreationTime'
-    }
-    if ($ab -match '^(?i)earliest$') {
-        return 'Earliest'
-    }
-    return $null
-}
-
 function Get-FileAgeTimestamp {
     param(
         $FileInfo,
@@ -494,6 +541,15 @@ function Get-FileAgeTimestamp {
     switch ($Basis) {
         'CreationTime' {
             return $FileInfo.CreationTime
+        }
+        'LastAccessTime' {
+            return $FileInfo.LastAccessTime
+        }
+        'LatestWriteOrAccess' {
+            if ($FileInfo.LastWriteTime -gt $FileInfo.LastAccessTime) {
+                return $FileInfo.LastWriteTime
+            }
+            return $FileInfo.LastAccessTime
         }
         'Earliest' {
             if ($FileInfo.LastWriteTime -lt $FileInfo.CreationTime) {
@@ -507,6 +563,36 @@ function Get-FileAgeTimestamp {
     }
 }
 
+function Resolve-OwnerDisplayName {
+    param([string]$OwnerString)
+    if ([string]::IsNullOrWhiteSpace($OwnerString)) {
+        return ''
+    }
+    $s = $OwnerString.Trim()
+    if ($s -match '^(?i)O:(S-1-5-[0-9\-]+)$') {
+        $s = $Matches[1]
+    }
+    if ($s -match '^S-1-5-[0-9\-]+$') {
+        try {
+            $sidObj = New-Object System.Security.Principal.SecurityIdentifier($s)
+            $nt = $sidObj.Translate([System.Security.Principal.NTAccount])
+            return [string]$nt.Value
+        }
+        catch {
+            return 'No active user'
+        }
+    }
+    try {
+        $ntAcc = New-Object System.Security.Principal.NTAccount($s)
+        $sidObj2 = $ntAcc.Translate([System.Security.Principal.SecurityIdentifier])
+        $ntBack = $sidObj2.Translate([System.Security.Principal.NTAccount])
+        return [string]$ntBack.Value
+    }
+    catch {
+        return 'No active user'
+    }
+}
+
 function Get-FileOwnerForReport {
     param([string]$LiteralPath)
     if ([string]::IsNullOrWhiteSpace($LiteralPath)) {
@@ -514,13 +600,35 @@ function Get-FileOwnerForReport {
     }
     try {
         $acl = Get-Acl -LiteralPath $LiteralPath -ErrorAction Stop
-        if ($null -ne $acl -and -not [string]::IsNullOrWhiteSpace($acl.Owner)) {
-            return [string]$acl.Owner
+        if ($null -eq $acl -or [string]::IsNullOrWhiteSpace($acl.Owner)) {
+            return ''
         }
+        return (Resolve-OwnerDisplayName -OwnerString ([string]$acl.Owner))
     }
     catch {
     }
     return ''
+}
+
+function Get-ReportDateColumnHeader {
+    param([string]$Basis)
+    switch ($Basis) {
+        'LastAccessTime' {
+            return 'Last opened (access)'
+        }
+        'LatestWriteOrAccess' {
+            return 'Age date (max modified / access)'
+        }
+        'CreationTime' {
+            return 'Created'
+        }
+        'Earliest' {
+            return 'Older of created / modified'
+        }
+        default {
+            return 'Last modified'
+        }
+    }
 }
 
 function Format-DataSize {
@@ -600,7 +708,8 @@ function Get-ReportDomainLabelForFilename {
 function Get-ArchiveHtmlReportFilename {
     param(
         [string]$DomainPart,
-        [string]$InputResolved
+        [string]$InputResolved,
+        [string]$ShareNameLabel = ''
     )
     $d = $DomainPart
     foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) {
@@ -630,6 +739,21 @@ function Get-ArchiveHtmlReportFilename {
     }
     if ($sharePart.Length -gt 100) {
         $sharePart = $sharePart.Substring(0, 100).TrimEnd('-')
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ShareNameLabel)) {
+        $sn = $ShareNameLabel.Trim()
+        foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) {
+            $sn = $sn.Replace([string]$c, '_')
+        }
+        $sn = ($sn -replace '\s+', '_').Trim('._')
+        if ([string]::IsNullOrWhiteSpace($sn)) {
+            $sn = 'Share'
+        }
+        if ($sn.Length -gt 48) {
+            $sn = $sn.Substring(0, 48).TrimEnd('_')
+        }
+        $sharePart = $sn + '-' + $sharePart
     }
 
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -700,7 +824,7 @@ function Write-ArchiveHtmlReport {
                 if ([string]::IsNullOrWhiteSpace($leaf)) {
                     $leaf = $r.SourcePath
                 }
-                $lwt = $r.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+                $lwt = $r.ComparedForAge.ToString('yyyy-MM-dd HH:mm')
                 $len = '{0:N0}' -f $r.Length
                 $own = $r.Owner
                 if ([string]::IsNullOrWhiteSpace("$own")) {
@@ -834,7 +958,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: now
           <tr>
             <th>File</th>
             <th>Owner</th>
-            <th>Last modified</th>
+            <th>$(ConvertTo-HtmlEncodedText (Get-ReportDateColumnHeader -Basis $AgeBasis))</th>
             <th>Size (bytes)</th>
           </tr>
         </thead>
@@ -852,13 +976,330 @@ $js
     [System.IO.File]::WriteAllText($LiteralPath, $html, $utf8NoBom)
 }
 
-# --- Resolve configuration (CLI > saved JSON > prompts) ---
+# Single-path scan, age filter, optional moves, and report output. Also invoked once per share when -All is used.
+function Invoke-SingleArchiveJob {
+    param(
+        [string]$InputResolved,
+        [string]$ArchiveResolved,
+        [double]$YearsNum,
+        [string]$AgeBasisEff,
+        [bool]$DoCommit,
+        [string]$OutFormatIn,
+        [string]$ShareNameLabel = '',
+        [bool]$BoundRemoveEmptyFolders = $false,
+        [string]$RemoveEmptyFoldersParam = '',
+        [string]$RemoveEmptyPref = ''
+    )
+
+    $inputResolved = $InputResolved.TrimEnd('\')
+    $archiveResolved = $ArchiveResolved.TrimEnd('\')
+    $ageBasisEffective = $AgeBasisEff
+    $doCommit = $DoCommit
+    $yrs = $YearsNum
+
+    $cutoff = (Get-Date).AddYears(-$yrs)
+    Write-Host ''
+    Write-Host '========== ARCHIVE RUN ==========' -ForegroundColor Cyan
+    Write-Host ('  Source tree (InputPath):  {0}' -f $inputResolved)
+    Write-Host ('  Archive root:             {0}' -f $archiveResolved)
+    Write-Host ('  Age rule: older than {0} year(s); using {1} (must be strictly before {2}).' -f $yrs, $ageBasisEffective, $cutoff)
+    if ($ageBasisEffective -eq 'LastAccessTime') {
+        Write-Host '  Note: LastAccessTime depends on NTFS last-access tracking; if the volume disables it, dates may look stale.' -ForegroundColor DarkGray
+    }
+    Write-Host ('  Mode: {0}' -f $(if ($doCommit) { 'COMMIT - files will be moved to the archive' } else { 'PREVIEW - no moves; plan only' }))
+    Write-Host '=================================' -ForegroundColor Cyan
+    Write-Host ''
+
+    $topLevelEntryCount = -1
+    $depth1FileCount = -1
+    $topLevelFolderCount = -1
+    try {
+        $topChildren = @(Get-ChildItem -LiteralPath $inputResolved -Force -ErrorAction Stop)
+        $topLevelEntryCount = $topChildren.Count
+        $depth1FileCount = @($topChildren | Where-Object { -not $_.PSIsContainer }).Count
+        $topLevelFolderCount = @($topChildren | Where-Object { $_.PSIsContainer }).Count
+    }
+    catch {
+        throw "Could not list the root of InputPath (before recursive scan). Path: $inputResolved  $($_.Exception.Message)"
+    }
+
+    Write-Host '--- Step 1: Can we read the source folder? (top level only) ---' -ForegroundColor DarkGray
+    Write-Host ("  Entries at root: {0} ({1} files, {2} subfolders here)." -f $topLevelEntryCount, $depth1FileCount, $topLevelFolderCount) -ForegroundColor DarkGray
+    Write-Host ''
+
+    $results = New-Object System.Collections.Generic.List[object]
+
+    $files = @(
+        Get-ChildItem -LiteralPath $inputResolved -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable gciErrors
+    )
+
+    $gciErrCount = 0
+    if ($null -ne $gciErrors) {
+        $gciErrCount = @($gciErrors).Count
+    }
+    if ($gciErrCount -gt 0) {
+        Write-Host ""
+        Write-Host "RECURSIVE SCAN REPORTED $gciErrCount ERROR(S) - results may be incomplete (0 files can mean everything below was blocked). First errors:" -ForegroundColor Red
+        $errArr = @($gciErrors)
+        $showErr = [Math]::Min(8, $gciErrCount)
+        for ($ei = 0; $ei -lt $showErr; $ei++) {
+            Write-Host "  [$($ei + 1)] $($errArr[$ei].Exception.Message)" -ForegroundColor Red
+        }
+        if ($gciErrCount -gt $showErr) {
+            Write-Host "  ... and $($gciErrCount - $showErr) more (see Warning stream for full list)." -ForegroundColor Red
+        }
+        Write-Host ""
+        foreach ($err in $errArr) {
+            Write-Warning "Enumeration issue: $($err.Exception.Message)"
+        }
+    }
+
+    $firstGciErrorLog = ''
+    if ($gciErrCount -gt 0) {
+        $em = [string](@($gciErrors)[0].Exception.Message)
+        $em = $em -replace '[\r\n]+', ' '
+        if ($em.Length -gt 240) {
+            $em = $em.Substring(0, 237) + '...'
+        }
+        $firstGciErrorLog = $em
+    }
+
+    $fileScanCount = $files.Count
+    Write-Host '--- Step 2: Recursive file list under source ---' -ForegroundColor DarkGray
+    Write-Host ("  Total files found (all ages): {0}" -f $fileScanCount) -ForegroundColor DarkGray
+    if ($fileScanCount -eq 0) {
+        Write-Host '  No files returned by Get-ChildItem -Recurse -File.' -ForegroundColor Yellow
+        Write-Host '  Check: empty tree, permissions on subfolders, or wrong InputPath.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+
+    Write-Host '--- Step 3: Compare each file to the cutoff (older files are listed below) ---' -ForegroundColor DarkGray
+    Write-Host ''
+
+    $skippedTooNew = 0
+    foreach ($file in $files) {
+        $sourcePath = $file.FullName
+        $destPath = $null
+        $comparedForAge = Get-FileAgeTimestamp -FileInfo $file -Basis $ageBasisEffective
+        try {
+            if ($comparedForAge -ge $cutoff) {
+                $skippedTooNew++
+                continue
+            }
+
+            $relative = Get-RelativePathFromRoot -FileFullName $sourcePath -RootFullName $inputResolved
+            $initialDest = Join-Path $archiveResolved $relative
+            $destPath = Get-UniqueDestinationFilePath -InitialDestPath $initialDest
+
+            if (-not $doCommit) {
+                $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
+                $results.Add([pscustomobject]@{
+                        SourcePath       = $sourcePath
+                        DestinationPath  = $destPath
+                        ComparedForAge   = $comparedForAge
+                        LastWriteTime    = $file.LastWriteTime
+                        CreationTime     = $file.CreationTime
+                        Length           = $file.Length
+                        Owner            = $ownerSnap
+                        Status           = 'Planned'
+                        Message          = ''
+                    })
+                continue
+            }
+
+            $destDir = Split-Path -Parent $destPath
+            if (-not (Test-Path -LiteralPath $destDir)) {
+                $null = New-Item -ItemType Directory -Path $destDir -Force -ErrorAction Stop
+            }
+
+            $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
+            Move-Item -LiteralPath $sourcePath -Destination $destPath -Force -ErrorAction Stop
+            $results.Add([pscustomobject]@{
+                    SourcePath       = $sourcePath
+                    DestinationPath  = $destPath
+                    ComparedForAge   = $comparedForAge
+                    LastWriteTime    = $file.LastWriteTime
+                    CreationTime     = $file.CreationTime
+                    Length           = $file.Length
+                    Owner            = $ownerSnap
+                    Status           = 'Moved'
+                    Message          = ''
+                })
+        }
+        catch {
+            $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
+            $results.Add([pscustomobject]@{
+                    SourcePath       = $sourcePath
+                    DestinationPath  = if ($null -ne $destPath -and $destPath -ne '') { $destPath } else { '' }
+                    ComparedForAge   = $comparedForAge
+                    LastWriteTime    = $file.LastWriteTime
+                    CreationTime     = $file.CreationTime
+                    Length           = $file.Length
+                    Owner            = $ownerSnap
+                    Status           = 'Failed'
+                    Message          = $_.Exception.Message
+                })
+            Write-Host "FAILED: $sourcePath - $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+
+    $plannedMovedRows = @($results | Where-Object { $_.Status -in 'Planned', 'Moved' })
+    $failedRows = @($results | Where-Object { $_.Status -eq 'Failed' })
+    $reclaimBytes = [long]0
+    $sumObj = $plannedMovedRows | Measure-Object -Property Length -Sum
+    if ($null -ne $sumObj -and $null -ne $sumObj.Sum) {
+        $reclaimBytes = [long]$sumObj.Sum
+    }
+    $reclaimDisplay = Format-DataSize -Bytes $reclaimBytes
+
+    Write-Host ''
+    Write-Host '--- Step 4: Age filter summary ---' -ForegroundColor DarkGray
+    Write-Host ("  Files skipped (too new, on or after cutoff): {0}" -f $skippedTooNew) -ForegroundColor DarkGray
+    Write-Host ("  Files listed for archive (met age rule):     {0}" -f $results.Count) -ForegroundColor DarkGray
+    Write-Host ("    - Planned or Moved (success path):         {0}" -f $plannedMovedRows.Count) -ForegroundColor DarkGray
+    Write-Host ("    - Failed (met age but error on move/plan): {0}" -f $failedRows.Count) -ForegroundColor DarkGray
+    Write-Host ("  Total size of Planned+Moved (space no longer on source after a successful move): {0} ({1} bytes)" -f $reclaimDisplay, $reclaimBytes) -ForegroundColor DarkGray
+    Write-Host ''
+
+    $removeEmptyChoice = $null
+    if ($doCommit) {
+        $doPrune = $false
+        if ($BoundRemoveEmptyFolders) {
+            $doPrune = ($RemoveEmptyFoldersParam -eq 'Yes')
+        }
+        elseif ($RemoveEmptyPref -in 'Yes', 'No') {
+            $doPrune = ($RemoveEmptyPref -eq 'Yes')
+        }
+        else {
+            $answer = Read-Host "Remove empty folders under the input tree (never the input root)? [y/N]"
+            $doPrune = ($answer -match '^(y|yes)$')
+        }
+
+        if ($doPrune) {
+            $removeEmptyChoice = 'Yes'
+            $dirs = @(
+                Get-ChildItem -LiteralPath $inputResolved -Recurse -Directory -Force -ErrorAction SilentlyContinue |
+                Sort-Object { $_.FullName.Length } -Descending
+            )
+            foreach ($dir in $dirs) {
+                if ($dir.FullName.TrimEnd('\') -eq $inputResolved.TrimEnd('\')) {
+                    continue
+                }
+                try {
+                    $itemCount = (Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction Stop | Measure-Object).Count
+                    if ($itemCount -eq 0) {
+                        Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop
+                        Write-Host "Removed empty folder: $($dir.FullName)" -ForegroundColor DarkGray
+                    }
+                }
+                catch {
+                    Write-Warning "Could not remove folder $($dir.FullName): $($_.Exception.Message)"
+                }
+            }
+        }
+        else {
+            $removeEmptyChoice = 'No'
+        }
+    }
+
+    $outFormat = Normalize-SavedOutputFormat -Raw $OutFormatIn
+    if ($null -eq $outFormat) {
+        $outFormat = ''
+    }
+    if ($outFormat -notin 'Text', 'HTML') {
+        do {
+            $outFormat = Read-Host "Output format: type Text or HTML"
+            $outFormat = $outFormat.Trim()
+            switch -Regex ($outFormat) {
+                '^(?i)text$' { $outFormat = 'Text' }
+                '^(?i)html$' { $outFormat = 'HTML' }
+                '^(?i)csv$' { $outFormat = 'HTML' }
+            }
+        } while ($outFormat -notin 'Text', 'HTML')
+    }
+
+    $htmlReportOutPath = $null
+    if ($outFormat -eq 'Text') {
+        Write-Host ''
+        Write-Host '========== DETAIL: FILES THAT MET THE AGE RULE ==========' -ForegroundColor Cyan
+        if ($results.Count -eq 0) {
+            Write-Host '  (none)' -ForegroundColor DarkGray
+        }
+        else {
+            $results | Format-Table -AutoSize -Property SourcePath, Owner, ComparedForAge, LastWriteTime, Length, Status, Message
+        }
+        Write-Host '=========================================================' -ForegroundColor Cyan
+    }
+    else {
+        $domainForReport = Get-ReportDomainLabelForFilename
+        $htmlBaseName = Get-ArchiveHtmlReportFilename -DomainPart $domainForReport -InputResolved $inputResolved -ShareNameLabel $ShareNameLabel
+        $htmlReportOutPath = Join-Path $archiveResolved $htmlBaseName
+        Write-ArchiveHtmlReport -LiteralPath $htmlReportOutPath -ResultRows $results -InputResolved $inputResolved -ArchiveResolved $archiveResolved `
+            -Years $yrs -AgeBasis $ageBasisEffective -Cutoff $cutoff -Commit $doCommit -ScriptVersion $script:Version `
+            -FileScanCount $fileScanCount -SkippedTooNew $skippedTooNew -PlannedMovedCount $plannedMovedRows.Count -FailedCount $failedRows.Count `
+            -ReclaimBytes $reclaimBytes -ReclaimDisplay $reclaimDisplay -DomainLabel $domainForReport
+        Write-Host ''
+        Write-Host "HTML report written: $htmlReportOutPath" -ForegroundColor Cyan
+        Write-Host ("  Rows (met age rule): {0}" -f $results.Count) -ForegroundColor DarkGray
+    }
+
+    Write-Host ''
+    Write-Host '==============================================================================' -ForegroundColor Cyan
+    Write-Host ' FINAL SUMMARY (this source)' -ForegroundColor Cyan
+    Write-Host '==============================================================================' -ForegroundColor Cyan
+    Write-Host ('  Script version:          {0}' -f $script:Version)
+    Write-Host ('  InputPath (resolved):    {0}' -f $inputResolved)
+    Write-Host ('  ArchivePath (resolved):  {0}' -f $archiveResolved)
+    Write-Host ('  Years / AgeBasis:        {0} / {1}' -f $yrs, $ageBasisEffective)
+    Write-Host ('  Cutoff (exclusive):      {0}' -f $cutoff)
+    Write-Host ('  Mode:                    {0}' -f $(if ($doCommit) { 'Commit (moves performed where successful)' } else { 'Preview (no moves)' }))
+    Write-Host ('  Output format this run:  {0}' -f $outFormat)
+    if ($outFormat -eq 'HTML' -and $null -ne $htmlReportOutPath) {
+        Write-Host ('  HTML report path:        {0}' -f $htmlReportOutPath)
+    }
+    Write-Host ('  Files scanned (all ages): {0}' -f $fileScanCount)
+    Write-Host ('  Skipped (too new):        {0}' -f $skippedTooNew)
+    Write-Host ('  Listed (met age rule):    {0}' -f $results.Count)
+    Write-Host ('    Planned + Moved:        {0}' -f $plannedMovedRows.Count)
+    Write-Host ('    Failed:                 {0}' -f $failedRows.Count)
+    Write-Host ('  Source space from Planned+Moved: {0} ({1} bytes)' -f $reclaimDisplay, $reclaimBytes)
+    Write-Host '    (After commit, this much file data no longer lives under the source tree.)' -ForegroundColor DarkGray
+    Write-Host '==============================================================================' -ForegroundColor Cyan
+    Write-Host ''
+
+    return [pscustomobject]@{
+        InputResolved          = $inputResolved
+        ArchiveResolved        = $archiveResolved
+        Results                = $results.ToArray()
+        FileScanCount          = $fileScanCount
+        SkippedTooNew          = $skippedTooNew
+        PlannedMovedCount      = $plannedMovedRows.Count
+        FailedCount            = $failedRows.Count
+        ReclaimBytes           = $reclaimBytes
+        ReclaimDisplay         = $reclaimDisplay
+        HtmlReportPath         = $htmlReportOutPath
+        OutFormat              = $outFormat
+        TopLevelEntryCount     = $topLevelEntryCount
+        Depth1FileCount        = $depth1FileCount
+        TopLevelFolderCount    = $topLevelFolderCount
+        GciErrorCount          = $gciErrCount
+        FirstGciErrorLog       = $firstGciErrorLog
+        DoCommitUsed           = $doCommit
+        RemoveEmptyChoice      = $removeEmptyChoice
+        Cutoff                 = $cutoff
+        AgeBasisEffective      = $ageBasisEffective
+        YearsNum               = $yrs
+    }
+}
+
+# --- Resolve configuration: command line, then Archive-OldFiles.config.json, then interactive prompts ---
 
 $configFile = if ($ConfigPath) { $ConfigPath } else { Get-DefaultConfigPath }
 
-$coreProvidedOnCli = (-not [string]::IsNullOrWhiteSpace("$InputPath")) -and
-(-not [string]::IsNullOrWhiteSpace("$ArchivePath")) -and
-(-not [string]::IsNullOrWhiteSpace("$Years")) -and ($yrs -gt 0)
+$coreProvidedOnCli = (-not [string]::IsNullOrWhiteSpace("$ArchivePath")) -and
+(-not [string]::IsNullOrWhiteSpace("$Years")) -and ($yrs -gt 0) -and (
+    $allSharesFlag -or ((-not [string]::IsNullOrWhiteSpace("$InputPath")))
+)
 
 $in = $InputPath
 $arch = $ArchivePath
@@ -866,6 +1307,10 @@ $doCommit = ConvertTo-BoundBool $Commit
 $outPref = $Output
 $removePref = $RemoveEmptyFolders
 $effectiveArchiveShareName = $ArchiveShareName
+
+if ($allSharesFlag -and -not [string]::IsNullOrWhiteSpace("$InputPath")) {
+    Write-Host 'Note: -All ignores InputPath; each published disk share is scanned in preview-only mode.' -ForegroundColor Yellow
+}
 
 if ($coreProvidedOnCli) {
     Write-Host 'Core parameters supplied on command line; skipping saved-config load for InputPath, ArchivePath, and Years.' -ForegroundColor DarkGray
@@ -876,7 +1321,7 @@ if ($coreProvidedOnCli) {
             $effectiveArchiveShareName = [string]$savedSide.ArchiveShareName.Trim()
         }
     }
-    if (-not $PSBoundParameters.ContainsKey('Commit') -and $null -ne $savedSide -and $null -ne $savedSide.PSObject.Properties['Commit']) {
+    if (-not $PSBoundParameters.ContainsKey('Commit') -and -not $allSharesFlag -and $null -ne $savedSide -and $null -ne $savedSide.PSObject.Properties['Commit']) {
         $doCommit = [bool]$savedSide.Commit
     }
     if (-not $PSBoundParameters.ContainsKey('Output') -and $null -ne $savedSide) {
@@ -960,7 +1405,7 @@ else {
         if ([string]::IsNullOrWhiteSpace("$Years")) {
             $yrs = [double]$saved.Years
         }
-        if (-not $PSBoundParameters.ContainsKey('Commit')) {
+        if (-not $PSBoundParameters.ContainsKey('Commit') -and -not $allSharesFlag) {
             $doCommit = [bool]$saved.Commit
         }
         if (-not ($PSBoundParameters.ContainsKey('Output') -and $Output -in 'Text', 'HTML')) {
@@ -984,20 +1429,22 @@ else {
         }
     }
     else {
-        if ([string]::IsNullOrWhiteSpace($in)) {
-            $pickedIn = $null
-            if (-not $skipShareMenuFlag) {
-                $pickedIn = Invoke-InputPathShareMenu
-            }
-            if (-not [string]::IsNullOrWhiteSpace($pickedIn)) {
-                $in = Normalize-UserPath -Path $pickedIn
-            }
-            else {
-                $def = if ($null -ne $saved) { $saved.InputPath } else { '' }
-                $prompt = if ($def) { "InputPath [$def]" } else { 'InputPath' }
-                $r = Read-Host $prompt
-                $in = if ([string]::IsNullOrWhiteSpace($r)) { $def } else { $r }
-                $in = Normalize-UserPath -Path $in
+        if (-not $allSharesFlag) {
+            if ([string]::IsNullOrWhiteSpace($in)) {
+                $pickedIn = $null
+                if (-not $skipShareMenuFlag) {
+                    $pickedIn = Invoke-InputPathShareMenu
+                }
+                if (-not [string]::IsNullOrWhiteSpace($pickedIn)) {
+                    $in = Normalize-UserPath -Path $pickedIn
+                }
+                else {
+                    $def = if ($null -ne $saved) { $saved.InputPath } else { '' }
+                    $prompt = if ($def) { "InputPath [$def]" } else { 'InputPath' }
+                    $r = Read-Host $prompt
+                    $in = if ([string]::IsNullOrWhiteSpace($r)) { $def } else { $r }
+                    $in = Normalize-UserPath -Path $in
+                }
             }
         }
         if ([string]::IsNullOrWhiteSpace($arch)) {
@@ -1032,7 +1479,7 @@ else {
                 }
             }
         }
-        if (-not $PSBoundParameters.ContainsKey('Commit')) {
+        if (-not $PSBoundParameters.ContainsKey('Commit') -and -not $allSharesFlag) {
             $defC = if ($null -ne $saved) { [bool]$saved.Commit } else { $false }
             $r = Read-Host "Run with -Commit (actually move files)? Current default [$defC] (y/N)"
             if ($r -match '^(y|yes)$') {
@@ -1045,7 +1492,7 @@ else {
                 $doCommit = $defC
             }
         }
-        if (-not $PSBoundParameters.ContainsKey('Output')) {
+        if (-not $PSBoundParameters.ContainsKey('Output') -and -not $allSharesFlag) {
             $defO = ''
             if ($null -ne $saved) {
                 $normDef = Normalize-SavedOutputFormat -Raw $saved.Output
@@ -1071,7 +1518,7 @@ else {
                 $outPref = $defO
             }
         }
-        if (-not $PSBoundParameters.ContainsKey('RemoveEmptyFolders') -and $doCommit) {
+        if (-not $PSBoundParameters.ContainsKey('RemoveEmptyFolders') -and $doCommit -and -not $allSharesFlag) {
             if ($null -ne $saved -and $saved.RemoveEmptyFolders -in 'Yes', 'No') {
                 $defRm = [string]$saved.RemoveEmptyFolders
             }
@@ -1083,6 +1530,34 @@ else {
             }
             elseif ($r -in 'Yes', 'No', 'yes', 'no', 'y', 'n') {
                 $removePref = if ($r -match '^(Yes|y|yes)$') { 'Yes' } else { 'No' }
+            }
+        }
+        if (-not $PSBoundParameters.ContainsKey('AgeBasis')) {
+            $defAb = 'LastWriteTime'
+            if ($null -ne $saved) {
+                $pnAb = @($saved.PSObject.Properties | ForEach-Object { $_.Name })
+                if (($pnAb -contains 'AgeBasis') -and -not [string]::IsNullOrWhiteSpace($saved.AgeBasis)) {
+                    $tryDef = Resolve-AgeBasisFromString -Raw ([string]$saved.AgeBasis)
+                    if ($null -ne $tryDef) {
+                        $defAb = $tryDef
+                    }
+                }
+            }
+            Write-Host ''
+            Write-Host 'Age basis (date compared to the cutoff):' -ForegroundColor DarkGray
+            Write-Host '  A / LastWriteTime / Modified          = last modified time (default)' -ForegroundColor DarkGray
+            Write-Host '  B / LastAccessTime / Opened           = last access (NTFS; can be wrong if last-access updates are disabled)' -ForegroundColor DarkGray
+            Write-Host '  C / LatestWriteOrAccess / ModifiedOrOpened = newer of modified and last access' -ForegroundColor DarkGray
+            Write-Host '  CreationTime, Earliest                = created, or older of created vs modified' -ForegroundColor DarkGray
+            $r = Read-Host "AgeBasis [$defAb]"
+            if (-not [string]::IsNullOrWhiteSpace($r)) {
+                $nab = Normalize-AgeBasisParameter -abRaw $r
+                if ($null -ne $nab) {
+                    $ageBasisEffective = $nab
+                }
+            }
+            else {
+                $ageBasisEffective = $defAb
             }
         }
     }
@@ -1101,22 +1576,28 @@ while ($true) {
         exit 1
     }
 
-    $issues = @(Test-SingleConfigValidity -InputPath $in -ArchivePath $arch -Years $yrs -DoCommit $doCommit)
+    $validateDoCommit = $doCommit -and -not $allSharesFlag
+    $issues = @(Test-SingleConfigValidity -InputPath $in -ArchivePath $arch -Years $yrs -DoCommit $validateDoCommit -AllSharesMode:$allSharesFlag)
 
     if ($issues.Count -eq 0) {
         break
     }
 
-    $onlyArchiveMissing = (-not $doCommit) -and ($issues.Count -eq 1) -and ($issues[0].Field -eq 'ArchivePath') -and
+    $onlyArchiveMissing = (-not $validateDoCommit) -and ($issues.Count -eq 1) -and ($issues[0].Field -eq 'ArchivePath') -and
     ($issues[0].Message -match 'does not exist')
 
     if ($onlyArchiveMissing) {
         Write-Host ''
-        Write-Host 'The archive folder does not exist yet. Preview mode requires that folder to exist (or use -Commit to create it).' -ForegroundColor Yellow
-        $offerCommit = Read-Host 'Use -Commit for this run so the archive folder can be created? [y/N]'
-        if ($offerCommit -match '^(y|yes)$') {
-            $doCommit = $true
-            continue
+        if ($allSharesFlag) {
+            Write-Host 'The archive folder does not exist yet. Create it manually first; -All only writes HTML reports (preview, no -Commit).' -ForegroundColor Yellow
+        }
+        else {
+            Write-Host 'The archive folder does not exist yet. Preview mode requires that folder to exist (or use -Commit to create it).' -ForegroundColor Yellow
+            $offerCommit = Read-Host 'Use -Commit for this run so the archive folder can be created? [y/N]'
+            if ($offerCommit -match '^(y|yes)$') {
+                $doCommit = $true
+                continue
+            }
         }
     }
 
@@ -1191,310 +1672,166 @@ if ($null -ne $normCliOut) {
 $RemoveEmptyFolders = $removePref
 $AgeBasis = $ageBasisEffective
 
-# --- Main ---
-
-try {
-    $inputResolved = Get-ResolvedPath -Path $InputPath
-    $inputRootItem = Get-Item -LiteralPath $inputResolved -Force -ErrorAction Stop
-    if (-not $inputRootItem.PSIsContainer) {
-        throw "InputPath must be a folder (directory), not a file: $inputResolved"
-    }
-}
-catch {
-    Write-Error $_
-    exit 1
+if ($allSharesFlag) {
+    $doCommit = $false
+    $Output = 'HTML'
+    $outPref = 'HTML'
 }
 
-try {
-    if (-not (Test-Path -LiteralPath $ArchivePath)) {
-        if ($doCommit) {
-            $null = New-Item -ItemType Directory -Path $ArchivePath -Force -ErrorAction Stop
-        }
-        else {
-            throw "ArchivePath does not exist. Create the folder first for preview mode, or use -Commit to create it."
-        }
-    }
-    $archiveResolved = (Get-Item -LiteralPath $ArchivePath).FullName.TrimEnd('\')
-}
-catch {
-    Write-Error $_
-    exit 1
-}
+# --- Main: one Invoke-SingleArchiveJob call, or -All loop (preview-only, HTML per share) ---
 
-if (Test-ArchiveUnderInput -InputResolved $inputResolved -ArchiveResolved $archiveResolved) {
-    Write-Error "ArchivePath must not be the same as or inside InputPath. Input: $inputResolved  Archive: $archiveResolved"
-    exit 1
-}
+if ($allSharesFlag) {
+    Write-Host ''
+    Write-Host '========== ALL SHARES (preview only, one HTML report per share) ==========' -ForegroundColor Cyan
+    Write-Host ('  Report folder (ArchivePath): {0}' -f $ArchivePath)
+    Write-Host ('  Years: {0}  AgeBasis: {1}' -f $yrs, $ageBasisEffective)
+    Write-Host '  -Commit, saved Commit, and prompts are ignored for moves; no files are moved.'
+    Write-Host '==========================================================================' -ForegroundColor Cyan
+    Write-Host ''
 
-$cutoff = (Get-Date).AddYears(-$yrs)
-Write-Host ''
-Write-Host '========== ARCHIVE RUN ==========' -ForegroundColor Cyan
-Write-Host ('  Source tree (InputPath):  {0}' -f $inputResolved)
-Write-Host ('  Archive root:             {0}' -f $archiveResolved)
-Write-Host ('  Age rule: older than {0} year(s); using {1} (must be strictly before {2}).' -f $yrs, $ageBasisEffective, $cutoff)
-Write-Host ('  Mode: {0}' -f $(if ($doCommit) { 'COMMIT - files will be moved to the archive' } else { 'PREVIEW - no moves; plan only' }))
-Write-Host '=================================' -ForegroundColor Cyan
-Write-Host ''
-
-# Non-recursive probe: proves this account can list the folder and shows whether the tree looks empty from the OS.
-$topLevelEntryCount = -1
-$depth1FileCount = -1
-$topLevelFolderCount = -1
-try {
-    $topChildren = @(Get-ChildItem -LiteralPath $inputResolved -Force -ErrorAction Stop)
-    $topLevelEntryCount = $topChildren.Count
-    $depth1FileCount = @($topChildren | Where-Object { -not $_.PSIsContainer }).Count
-    $topLevelFolderCount = @($topChildren | Where-Object { $_.PSIsContainer }).Count
-}
-catch {
-    $probeErr = "Could not list the root of InputPath (this is before any recursive scan). Check that the path exists for this account and that you have NTFS/share List permission.{0}{0}Path: {1}{0}{2}" -f [Environment]::NewLine, $inputResolved, $_.Exception.Message
-    Write-Error $probeErr
-    exit 1
-}
-
-Write-Host '--- Step 1: Can we read the source folder? (top level only) ---' -ForegroundColor DarkGray
-Write-Host ("  Entries at root: {0} ({1} files, {2} subfolders here)." -f $topLevelEntryCount, $depth1FileCount, $topLevelFolderCount) -ForegroundColor DarkGray
-Write-Host ''
-
-$results = New-Object System.Collections.Generic.List[object]
-
-$files = @(
-    Get-ChildItem -LiteralPath $inputResolved -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable gciErrors
-)
-
-$gciErrCount = 0
-if ($null -ne $gciErrors) {
-    $gciErrCount = @($gciErrors).Count
-}
-if ($gciErrCount -gt 0) {
-    Write-Host ""
-    Write-Host "RECURSIVE SCAN REPORTED $gciErrCount ERROR(S) - results may be incomplete (0 files can mean everything below was blocked). First errors:" -ForegroundColor Red
-    $errArr = @($gciErrors)
-    $showErr = [Math]::Min(8, $gciErrCount)
-    for ($ei = 0; $ei -lt $showErr; $ei++) {
-        Write-Host "  [$($ei + 1)] $($errArr[$ei].Exception.Message)" -ForegroundColor Red
-    }
-    if ($gciErrCount -gt $showErr) {
-        Write-Host "  ... and $($gciErrCount - $showErr) more (see Warning stream for full list)." -ForegroundColor Red
-    }
-    Write-Host ""
-    foreach ($err in $errArr) {
-        Write-Warning "Enumeration issue: $($err.Exception.Message)"
-    }
-}
-
-$firstGciErrorLog = ''
-if ($gciErrCount -gt 0) {
-    $em = [string](@($gciErrors)[0].Exception.Message)
-    $em = $em -replace '[\r\n]+', ' '
-    if ($em.Length -gt 240) {
-        $em = $em.Substring(0, 237) + '...'
-    }
-    $firstGciErrorLog = $em
-}
-
-$fileScanCount = $files.Count
-Write-Host '--- Step 2: Recursive file list under source ---' -ForegroundColor DarkGray
-Write-Host ("  Total files found (all ages): {0}" -f $fileScanCount) -ForegroundColor DarkGray
-if ($fileScanCount -eq 0) {
-    Write-Host '  No files returned by Get-ChildItem -Recurse -File.' -ForegroundColor Yellow
-    Write-Host '  Check: empty tree, permissions on subfolders, or wrong InputPath.' -ForegroundColor Yellow
-}
-Write-Host ''
-
-Write-Host '--- Step 3: Compare each file to the cutoff (older files are listed below) ---' -ForegroundColor DarkGray
-Write-Host ''
-
-$skippedTooNew = 0
-foreach ($file in $files) {
-    $sourcePath = $file.FullName
-    $destPath = $null
-    $comparedForAge = Get-FileAgeTimestamp -FileInfo $file -Basis $ageBasisEffective
     try {
-        if ($comparedForAge -ge $cutoff) {
-            $skippedTooNew++
-            continue
+        if (-not (Test-Path -LiteralPath $ArchivePath)) {
+            throw "ArchivePath does not exist. Create the folder first; -All writes HTML reports there (preview only)."
         }
-
-        $relative = Get-RelativePathFromRoot -FileFullName $sourcePath -RootFullName $inputResolved
-        $initialDest = Join-Path $archiveResolved $relative
-        $destPath = Get-UniqueDestinationFilePath -InitialDestPath $initialDest
-
-        if (-not $doCommit) {
-            $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
-            $results.Add([pscustomobject]@{
-                    SourcePath       = $sourcePath
-                    DestinationPath  = $destPath
-                    ComparedForAge   = $comparedForAge
-                    LastWriteTime    = $file.LastWriteTime
-                    CreationTime     = $file.CreationTime
-                    Length           = $file.Length
-                    Owner            = $ownerSnap
-                    Status           = 'Planned'
-                    Message          = ''
-                })
-            continue
-        }
-
-        $destDir = Split-Path -Parent $destPath
-        if (-not (Test-Path -LiteralPath $destDir)) {
-            $null = New-Item -ItemType Directory -Path $destDir -Force -ErrorAction Stop
-        }
-
-        $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
-        Move-Item -LiteralPath $sourcePath -Destination $destPath -Force -ErrorAction Stop
-        $results.Add([pscustomobject]@{
-                SourcePath       = $sourcePath
-                DestinationPath  = $destPath
-                ComparedForAge   = $comparedForAge
-                LastWriteTime    = $file.LastWriteTime
-                CreationTime     = $file.CreationTime
-                Length           = $file.Length
-                Owner            = $ownerSnap
-                Status           = 'Moved'
-                Message          = ''
-            })
+        $archiveResolved = (Get-Item -LiteralPath $ArchivePath).FullName.TrimEnd('\')
     }
     catch {
-        $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
-        $results.Add([pscustomobject]@{
-                SourcePath       = $sourcePath
-                DestinationPath  = if ($null -ne $destPath -and $destPath -ne '') { $destPath } else { '' }
-                ComparedForAge   = $comparedForAge
-                LastWriteTime    = $file.LastWriteTime
-                CreationTime     = $file.CreationTime
-                Length           = $file.Length
-                Owner            = $ownerSnap
-                Status           = 'Failed'
-                Message          = $_.Exception.Message
-            })
-        Write-Host "FAILED: $sourcePath - $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
-
-$plannedMovedRows = @($results | Where-Object { $_.Status -in 'Planned', 'Moved' })
-$failedRows = @($results | Where-Object { $_.Status -eq 'Failed' })
-$reclaimBytes = [long]0
-$sumObj = $plannedMovedRows | Measure-Object -Property Length -Sum
-if ($null -ne $sumObj -and $null -ne $sumObj.Sum) {
-    $reclaimBytes = [long]$sumObj.Sum
-}
-$reclaimDisplay = Format-DataSize -Bytes $reclaimBytes
-
-Write-Host ''
-Write-Host '--- Step 4: Age filter summary ---' -ForegroundColor DarkGray
-Write-Host ("  Files skipped (too new, on or after cutoff): {0}" -f $skippedTooNew) -ForegroundColor DarkGray
-Write-Host ("  Files listed for archive (met age rule):     {0}" -f $results.Count) -ForegroundColor DarkGray
-Write-Host ("    - Planned or Moved (success path):         {0}" -f $plannedMovedRows.Count) -ForegroundColor DarkGray
-Write-Host ("    - Failed (met age but error on move/plan): {0}" -f $failedRows.Count) -ForegroundColor DarkGray
-Write-Host ("  Total size of Planned+Moved (space no longer on source after a successful move): {0} ({1} bytes)" -f $reclaimDisplay, $reclaimBytes) -ForegroundColor DarkGray
-Write-Host ''
-
-$removeEmptyChoice = $null
-if ($doCommit) {
-    $doPrune = $false
-    if ($PSBoundParameters.ContainsKey('RemoveEmptyFolders')) {
-        $doPrune = ($RemoveEmptyFolders -eq 'Yes')
-    }
-    elseif ($removePref -in 'Yes', 'No') {
-        $doPrune = ($removePref -eq 'Yes')
-    }
-    else {
-        $answer = Read-Host "Remove empty folders under the input tree (never the input root)? [y/N]"
-        $doPrune = ($answer -match '^(y|yes)$')
+        Write-Error $_
+        exit 1
     }
 
-    if ($doPrune) {
-        $removeEmptyChoice = 'Yes'
-        $dirs = @(
-            Get-ChildItem -LiteralPath $inputResolved -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-            Sort-Object { $_.FullName.Length } -Descending
-        )
-        foreach ($dir in $dirs) {
-            if ($dir.FullName.TrimEnd('\') -eq $inputResolved.TrimEnd('\')) {
-                continue
-            }
-            try {
-                $itemCount = (Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction Stop | Measure-Object).Count
-                if ($itemCount -eq 0) {
-                    Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction Stop
-                    Write-Host "Removed empty folder: $($dir.FullName)" -ForegroundColor DarkGray
-                }
-            }
-            catch {
-                Write-Warning "Could not remove folder $($dir.FullName): $($_.Exception.Message)"
+    $published = @(Get-PublishedDiskShares)
+    if ($published.Count -eq 0) {
+        Write-Error 'No published disk shares found (disk shares only; Type 0, names without a trailing $).'
+        exit 1
+    }
+
+    $outFormat = 'HTML'
+    $htmlReportOutPath = $null
+    $allHtmlPaths = New-Object System.Collections.Generic.List[string]
+    $shareJobs = New-Object System.Collections.Generic.List[object]
+    $cutoff = (Get-Date).AddYears(-$yrs)
+
+    foreach ($sh in $published) {
+        $shareRoot = $sh.LocalPath.TrimEnd('\')
+        if (Test-ArchiveUnderInput -InputResolved $shareRoot -ArchiveResolved $archiveResolved) {
+            Write-Host "Skipping share '$($sh.Name)' ($shareRoot): archive folder is this path or inside it." -ForegroundColor Yellow
+            continue
+        }
+        try {
+            $j = Invoke-SingleArchiveJob -InputResolved $shareRoot -ArchiveResolved $archiveResolved -YearsNum $yrs `
+                -AgeBasisEff $ageBasisEffective -DoCommit $false -OutFormatIn 'HTML' -ShareNameLabel $sh.Name `
+                -BoundRemoveEmptyFolders $false -RemoveEmptyFoldersParam '' -RemoveEmptyPref ''
+            $null = $shareJobs.Add($j)
+            if ($null -ne $j.HtmlReportPath -and $j.HtmlReportPath -ne '') {
+                $null = $allHtmlPaths.Add($j.HtmlReportPath)
             }
         }
-    }
-    else {
-        $removeEmptyChoice = 'No'
-    }
-}
-
-$outFormat = Normalize-SavedOutputFormat -Raw $Output
-if ($null -eq $outFormat) {
-    $outFormat = ''
-}
-if ($outFormat -notin 'Text', 'HTML') {
-    do {
-        $outFormat = Read-Host "Output format: type Text or HTML"
-        $outFormat = $outFormat.Trim()
-        switch -Regex ($outFormat) {
-            '^(?i)text$' { $outFormat = 'Text' }
-            '^(?i)html$' { $outFormat = 'HTML' }
-            '^(?i)csv$' { $outFormat = 'HTML' }
+        catch {
+            Write-Warning "Share '$($sh.Name)' ($shareRoot): $($_.Exception.Message)"
         }
-    } while ($outFormat -notin 'Text', 'HTML')
-}
+    }
 
-$htmlReportOutPath = $null
-if ($outFormat -eq 'Text') {
     Write-Host ''
-    Write-Host '========== DETAIL: FILES THAT MET THE AGE RULE ==========' -ForegroundColor Cyan
-    if ($results.Count -eq 0) {
-        Write-Host '  (none)' -ForegroundColor DarkGray
+    Write-Host '========== ALL-SHARES SUMMARY ==========' -ForegroundColor Cyan
+    Write-Host ("  Share jobs completed: {0}" -f $shareJobs.Count)
+    Write-Host ("  HTML reports written: {0}" -f $allHtmlPaths.Count)
+    foreach ($hp in $allHtmlPaths) {
+        Write-Host ("    {0}" -f $hp) -ForegroundColor DarkGray
     }
-    else {
-        $results | Format-Table -AutoSize -Property SourcePath, Owner, ComparedForAge, LastWriteTime, Length, Status, Message
+    Write-Host '========================================' -ForegroundColor Cyan
+    Write-Host ''
+
+    $InputPath = '(All published disk shares)'
+    $inputResolved = $InputPath
+    $doCommit = $false
+    $removeEmptyChoice = $null
+    $fileScanCount = 0
+    $skippedTooNew = 0
+    $plannedMovedCountAgg = 0
+    $failedCountAgg = 0
+    $reclaimBytesAgg = [long]0
+    $results = @()
+    $listedForArchiveAll = 0
+    foreach ($sj in $shareJobs) {
+        $fileScanCount += $sj.FileScanCount
+        $skippedTooNew += $sj.SkippedTooNew
+        $plannedMovedCountAgg += $sj.PlannedMovedCount
+        $failedCountAgg += $sj.FailedCount
+        $reclaimBytesAgg += $sj.ReclaimBytes
+        $listedForArchiveAll += $sj.Results.Count
     }
-    Write-Host '=========================================================' -ForegroundColor Cyan
+    $reclaimDisplay = Format-DataSize -Bytes $reclaimBytesAgg
+    $reclaimBytes = $reclaimBytesAgg
+    $topLevelEntryCount = -1
+    $depth1FileCount = -1
+    $topLevelFolderCount = -1
+    $gciErrCount = -1
+    $firstGciErrorLog = ''
+    $plannedMovedRows = @()
+    $failedRows = @()
 }
 else {
-    $domainForReport = Get-ReportDomainLabelForFilename
-    $htmlBaseName = Get-ArchiveHtmlReportFilename -DomainPart $domainForReport -InputResolved $inputResolved
-    $htmlReportOutPath = Join-Path $archiveResolved $htmlBaseName
-    Write-ArchiveHtmlReport -LiteralPath $htmlReportOutPath -ResultRows $results -InputResolved $inputResolved -ArchiveResolved $archiveResolved `
-        -Years $yrs -AgeBasis $ageBasisEffective -Cutoff $cutoff -Commit $doCommit -ScriptVersion $script:Version `
-        -FileScanCount $fileScanCount -SkippedTooNew $skippedTooNew -PlannedMovedCount $plannedMovedRows.Count -FailedCount $failedRows.Count `
-        -ReclaimBytes $reclaimBytes -ReclaimDisplay $reclaimDisplay -DomainLabel $domainForReport
-    Write-Host ''
-    Write-Host "HTML report written: $htmlReportOutPath" -ForegroundColor Cyan
-    Write-Host ("  Rows (met age rule): {0}" -f $results.Count) -ForegroundColor DarkGray
-}
+    try {
+        $inputResolved = Get-ResolvedPath -Path $InputPath
+        $inputRootItem = Get-Item -LiteralPath $inputResolved -Force -ErrorAction Stop
+        if (-not $inputRootItem.PSIsContainer) {
+            throw "InputPath must be a folder (directory), not a file: $inputResolved"
+        }
+    }
+    catch {
+        Write-Error $_
+        exit 1
+    }
 
-Write-Host ''
-Write-Host '==============================================================================' -ForegroundColor Cyan
-Write-Host ' FINAL SUMMARY' -ForegroundColor Cyan
-Write-Host '==============================================================================' -ForegroundColor Cyan
-Write-Host ('  Script version:          {0}' -f $script:Version)
-Write-Host ('  InputPath (resolved):    {0}' -f $inputResolved)
-Write-Host ('  ArchivePath (resolved):  {0}' -f $archiveResolved)
-Write-Host ('  Years / AgeBasis:        {0} / {1}' -f $yrs, $ageBasisEffective)
-Write-Host ('  Cutoff (exclusive):      {0}' -f $cutoff)
-Write-Host ('  Mode:                    {0}' -f $(if ($doCommit) { 'Commit (moves performed where successful)' } else { 'Preview (no moves)' }))
-Write-Host ('  Output format this run:  {0}' -f $outFormat)
-if ($outFormat -eq 'HTML' -and $null -ne $htmlReportOutPath) {
-    Write-Host ('  HTML report path:        {0}' -f $htmlReportOutPath)
+    try {
+        if (-not (Test-Path -LiteralPath $ArchivePath)) {
+            if ($doCommit) {
+                $null = New-Item -ItemType Directory -Path $ArchivePath -Force -ErrorAction Stop
+            }
+            else {
+                throw "ArchivePath does not exist. Create the folder first for preview mode, or use -Commit to create it."
+            }
+        }
+        $archiveResolved = (Get-Item -LiteralPath $ArchivePath).FullName.TrimEnd('\')
+    }
+    catch {
+        Write-Error $_
+        exit 1
+    }
+
+    if (Test-ArchiveUnderInput -InputResolved $inputResolved -ArchiveResolved $archiveResolved) {
+        Write-Error "ArchivePath must not be the same as or inside InputPath. Input: $inputResolved  Archive: $archiveResolved"
+        exit 1
+    }
+
+    $rbRm = $PSBoundParameters.ContainsKey('RemoveEmptyFolders')
+    $rmVal = if ($rbRm) { [string]$RemoveEmptyFolders } else { '' }
+    $rpStr = if ($null -ne $removePref) { [string]$removePref } else { '' }
+
+    $job = Invoke-SingleArchiveJob -InputResolved $inputResolved -ArchiveResolved $archiveResolved -YearsNum $yrs `
+        -AgeBasisEff $ageBasisEffective -DoCommit $doCommit -OutFormatIn "$Output" -ShareNameLabel '' `
+        -BoundRemoveEmptyFolders $rbRm -RemoveEmptyFoldersParam $rmVal -RemoveEmptyPref $rpStr
+
+    $inputResolved = $job.InputResolved
+    $archiveResolved = $job.ArchiveResolved
+    $results = $job.Results
+    $fileScanCount = $job.FileScanCount
+    $skippedTooNew = $job.SkippedTooNew
+    $plannedMovedRows = @($results | Where-Object { $_.Status -in 'Planned', 'Moved' })
+    $failedRows = @($results | Where-Object { $_.Status -eq 'Failed' })
+    $reclaimBytes = $job.ReclaimBytes
+    $reclaimDisplay = $job.ReclaimDisplay
+    $outFormat = $job.OutFormat
+    $htmlReportOutPath = $job.HtmlReportPath
+    $removeEmptyChoice = $job.RemoveEmptyChoice
+    $cutoff = $job.Cutoff
+    $topLevelEntryCount = $job.TopLevelEntryCount
+    $depth1FileCount = $job.Depth1FileCount
+    $topLevelFolderCount = $job.TopLevelFolderCount
+    $gciErrCount = $job.GciErrorCount
+    $firstGciErrorLog = $job.FirstGciErrorLog
 }
-Write-Host ('  Files scanned (all ages): {0}' -f $fileScanCount)
-Write-Host ('  Skipped (too new):        {0}' -f $skippedTooNew)
-Write-Host ('  Listed (met age rule):    {0}' -f $results.Count)
-Write-Host ('    Planned + Moved:        {0}' -f $plannedMovedRows.Count)
-Write-Host ('    Failed:                 {0}' -f $failedRows.Count)
-Write-Host ('  Source space from Planned+Moved: {0} ({1} bytes)' -f $reclaimDisplay, $reclaimBytes)
-Write-Host '    (After commit, this much file data no longer lives under the source tree.)' -ForegroundColor DarkGray
-Write-Host '==============================================================================' -ForegroundColor Cyan
-Write-Host ''
 
 if (-not $noSaveConfigFlag) {
     try {
@@ -1510,6 +1847,7 @@ if (-not $noSaveConfigFlag) {
             Commit             = [bool]$doCommit
             Output             = $outFormat
             RemoveEmptyFolders = $(if ($null -ne $removeEmptyChoice) { $removeEmptyChoice } else { $null })
+            AllShares          = [bool]$allSharesFlag
         }
         $json = $payload | ConvertTo-Json -Depth 4
         Set-Content -LiteralPath $configFile -Value $json -Encoding UTF8 -Force
@@ -1538,12 +1876,35 @@ if (-not $noRunLogFlag) {
         $null = $logBlock.Add("Years=$yrs AgeBasis=$ageBasisEffective Cutoff=$cutoff")
         $null = $logBlock.Add("Probe_TopLevelEntries=$topLevelEntryCount Probe_RootFiles=$depth1FileCount Probe_RootFolders=$topLevelFolderCount")
         $null = $logBlock.Add("GciErrorCount=$gciErrCount FirstGciError=$firstGciErrorLog")
-        $null = $logBlock.Add("FilesScanned=$fileScanCount SkippedNewerThanCutoff=$skippedTooNew ListedForArchive=$($results.Count) Output=$outFormat Commit=$doCommit")
-        $null = $logBlock.Add("PlannedMovedCount=$($plannedMovedRows.Count) FailedCount=$($failedRows.Count) ReclaimBytes_PlannedMoved=$reclaimBytes ReclaimHuman=$reclaimDisplay")
+        if ($allSharesFlag) {
+            $null = $logBlock.Add('Mode=AllSharesPreview Commit=false (forced)')
+            $pmcLog = $plannedMovedCountAgg
+            $fmcLog = $failedCountAgg
+            $listedLog = $listedForArchiveAll
+        }
+        else {
+            $pmcLog = $plannedMovedRows.Count
+            $fmcLog = $failedRows.Count
+            $listedLog = $results.Count
+        }
+        $null = $logBlock.Add("FilesScanned=$fileScanCount SkippedNewerThanCutoff=$skippedTooNew ListedForArchive=$listedLog Output=$outFormat Commit=$doCommit")
+        $null = $logBlock.Add("PlannedMovedCount=$pmcLog FailedCount=$fmcLog ReclaimBytes_PlannedMoved=$reclaimBytes ReclaimHuman=$reclaimDisplay")
         $null = $logBlock.Add("FILES_MEETING_AGE_RULE_TAB_SEPARATED_SourcePath_Bytes_Status_ComparedForAge_ISO")
-        foreach ($row in $results) {
-            $cmp = $row.ComparedForAge.ToString('o')
-            $null = $logBlock.Add(('{0}{1}{2}{1}{3}{1}{4}' -f $row.SourcePath, $tab, $row.Length, $row.Status, $cmp))
+        if ($allSharesFlag) {
+            foreach ($sj in $shareJobs) {
+                $null = $logBlock.Add("SHARE_BEGIN=$($sj.InputResolved)")
+                foreach ($row in $sj.Results) {
+                    $cmp = $row.ComparedForAge.ToString('o')
+                    $null = $logBlock.Add(('{0}{1}{2}{1}{3}{1}{4}' -f $row.SourcePath, $tab, $row.Length, $row.Status, $cmp))
+                }
+                $null = $logBlock.Add('SHARE_END')
+            }
+        }
+        else {
+            foreach ($row in $results) {
+                $cmp = $row.ComparedForAge.ToString('o')
+                $null = $logBlock.Add(('{0}{1}{2}{1}{3}{1}{4}' -f $row.SourcePath, $tab, $row.Length, $row.Status, $cmp))
+            }
         }
         $null = $logBlock.Add('END_FILES_MEETING_AGE_RULE')
         $null = $logBlock.Add('-----')
