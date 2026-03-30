@@ -13,6 +13,8 @@
     (older of creation vs last write; useful after copies/restores that refresh LastWriteTime).
 
     After a successful run, settings are saved to Archive-OldFiles.config.json next to the script (unless -NoSaveConfig).
+    Optional email after each run: recipients, From, and SMTP (Gmail / Microsoft 365 presets or custom) are saved under Email in that JSON;
+    the SMTP password is protected with Windows DPAPI (CurrentUser) and only decrypts for the same Windows user on the same machine.
     Each run also appends a short summary to Archive-OldFiles.run.log in the same folder (unless -NoRunLog).
     Optional HTML reports are written under the archive path; the file name includes computer/AD domain, the scanned path, and a timestamp.
     Use -All on a file server to preview every published folder share (HTML per share, never -Commit). Owner column resolves SIDs; unresolved or deleted accounts show as "No active user".
@@ -61,17 +63,47 @@
     Always runs in preview mode: no moves are performed even if -Commit or saved JSON says commit. Implies HTML output:
     one report file per share under ArchivePath. InputPath is ignored. Requires ArchivePath and Years (from parameters or saved config).
 
+.PARAMETER EmailTo
+    Comma-separated recipient addresses. Merged with saved Email settings (SMTP host, encrypted password, etc.).
+
+.PARAMETER EmailFrom
+    Sender address (must be allowed by your SMTP provider).
+
+.PARAMETER SmtpProfile
+    GmailAppPassword, Microsoft365AppPassword, Smtp2Go (mail.smtp2go.com, port 2525, TLS), or Custom. Sets default host/port/TLS when not Custom.
+
+.PARAMETER SmtpHost
+    Overrides saved/custom SMTP host when supplied.
+
+.PARAMETER SmtpPort
+    Overrides SMTP port (e.g. 587, or 2525 for SMTP2GO default).
+
+.PARAMETER SmtpUseSsl
+    Yes or No; enables TLS (typical for port 587).
+
+.PARAMETER SmtpUser
+    SMTP authentication user name (required by relay providers such as SMTP2GO: use the SMTP user from the provider dashboard).
+    If omitted in config but From is a valid email address, that address is used as the SMTP login when sending.
+
+.PARAMETER NoSendEmail
+    Do not send email after this run even if Email is enabled in config.
+
+.PARAMETER TestEmail
+    Send a single test message using saved Email settings from the JSON config (and any email-related parameters you pass),
+    then exit. Does not scan files, archive paths, or run the email setup wizard. Use to verify SMTP without a full run.
+    Ignores -NoSendEmail. Requires To, From, SmtpHost, and a DPAPI-protected password (from a prior interactive setup or JSON).
+
 .NOTES
     Purpose: Age-based archival of old files to a separate archive location.
     Author: Doug Hesseltine
     Created: 2026-03-27
-    Modified: 2026-03-28
-    Version: 1.7.2
+    Modified: 2026-03-27
+    Version: 1.8.4
 
     Troubleshooting (if the script will not run):
     - After downloading from the web, run: Unblock-File -Path .\Archive-OldFiles.ps1
     - Run explicitly: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Archive-OldFiles.ps1 -InputPath '...' -ArchivePath '...' -Years N
-    - Ensure the file is named Archive-OldFiles.ps1 (not .txt). Open in Notepad and Save As, Encoding: UTF-8 if you see odd characters.
+    - Ensure the file is named Archive-OldFiles.ps1 (not .txt). On Windows PowerShell 5.1, save as UTF-8 with BOM if you edit the script and see ParserError or garbled punctuation (em dashes and similar can break without BOM).
     - Settings: Archive-OldFiles.config.json next to the script. Run summary: Archive-OldFiles.run.log (same folder). HTML reports: archive root when you choose HTML.
     - ParserError (Unexpected token '}') after editing: replace the file with a full fresh copy from source; truncated saves break the script mid-block.
     - -All: use -All with no value (switch). Older copies used an untyped -All parameter and required -All:$true; update to v1.7.1+.
@@ -107,6 +139,16 @@
     .\Archive-OldFiles.ps1 -All -ArchivePath 'D:\Reports\ArchivePreviews' -Years 7
 
     Preview-only scan of all folder shares; writes one HTML report per share under the archive path (no -Commit).
+
+.EXAMPLE
+    .\Archive-OldFiles.ps1 -InputPath 'D:\Data' -ArchivePath 'D:\Arc' -Years 7 -EmailTo 'admin@contoso.com'
+
+    Uses saved SMTP settings from JSON; sends after the run when Email is enabled there.
+
+.EXAMPLE
+    .\Archive-OldFiles.ps1 -TestEmail
+
+    Sends one test message from saved Email.* in Archive-OldFiles.config.json (no scan, no prompts). Override e.g. -SmtpPort 2525 if needed.
 #>
 
 param(
@@ -122,7 +164,16 @@ param(
     $SkipShareMenu,
     $AgeBasis,
     $NoRunLog,
-    [switch]$All
+    [switch]$All,
+    $EmailTo,
+    $EmailFrom,
+    $SmtpProfile,
+    $SmtpHost,
+    $SmtpPort,
+    $SmtpUseSsl,
+    $SmtpUser,
+    [switch]$NoSendEmail,
+    [switch]$TestEmail
 )
 
 if ($PSVersionTable.PSVersion.Major -lt 5) {
@@ -271,11 +322,13 @@ if (-not [string]::IsNullOrWhiteSpace("$Years")) {
 $skipShareMenuFlag = ConvertTo-BoundBool $SkipShareMenu
 $noSaveConfigFlag = ConvertTo-BoundBool $NoSaveConfig
 $noRunLogFlag = ConvertTo-BoundBool $NoRunLog
+$noSendEmailFlag = $NoSendEmail.IsPresent
 $allSharesFlag = $All.IsPresent
+$testEmailFlag = $TestEmail.IsPresent
 
 $ErrorActionPreference = 'Stop'
 
-$script:Version = '1.7.2'
+$script:Version = '1.8.4'
 
 function Get-DefaultConfigPath {
     if ($PSScriptRoot) {
@@ -418,6 +471,394 @@ function Read-SavedConfigFromDisk {
     }
 }
 
+function Protect-ArchiveEmailPassword {
+    param([string]$PlainText)
+    if ([string]::IsNullOrWhiteSpace($PlainText)) {
+        return $null
+    }
+    try {
+        $null = [System.Reflection.Assembly]::LoadWithPartialName('System.Security')
+    }
+    catch {
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($PlainText)
+    $protected = [System.Security.Cryptography.ProtectedData]::Protect(
+        $bytes,
+        $null,
+        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    return [Convert]::ToBase64String($protected)
+}
+
+function Unprotect-ArchiveEmailPassword {
+    param([string]$Base64)
+    if ([string]::IsNullOrWhiteSpace($Base64)) {
+        return $null
+    }
+    try {
+        $null = [System.Reflection.Assembly]::LoadWithPartialName('System.Security')
+        $raw = [Convert]::FromBase64String($Base64)
+        $plainBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            $raw,
+            $null,
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        return [System.Text.Encoding]::UTF8.GetString($plainBytes)
+    }
+    catch {
+        throw "Cannot decrypt SMTP password on this account/machine (Windows DPAPI). Re-enter the password in email setup. $($_.Exception.Message)"
+    }
+}
+
+function ConvertTo-PlainStringFromSecureString {
+    param([System.Security.SecureString]$Secure)
+    if ($null -eq $Secure) {
+        return ''
+    }
+    $bstr = [IntPtr]::Zero
+    try {
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+}
+
+function Get-ArchiveEmailScanLabel {
+    param(
+        [string]$InputResolved,
+        [bool]$AllSharesMode
+    )
+    if ($AllSharesMode) {
+        return 'AllShares'
+    }
+    if ([string]::IsNullOrWhiteSpace($InputResolved)) {
+        return 'Source'
+    }
+    $p = $InputResolved.TrimEnd('\')
+    $leaf = Split-Path -Leaf -Path $p
+    if ([string]::IsNullOrWhiteSpace($leaf)) {
+        return ($p -replace '[:\\]+', '-').Trim('-')
+    }
+    return $leaf
+}
+
+function Get-ArchiveEmailAutoSubject {
+    param(
+        [string]$DomainLabel,
+        [string]$ScanLabel,
+        [bool]$CommitMode
+    )
+    $dom = if ([string]::IsNullOrWhiteSpace($DomainLabel)) { 'NODOMAIN' } else { $DomainLabel.Trim() }
+    $scan = if ([string]::IsNullOrWhiteSpace($ScanLabel)) { 'Scan' } else { $ScanLabel.Trim() }
+    $mode = if ($CommitMode) { 'Commit' } else { 'Preview' }
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
+    return "[Archive-OldFiles] $dom - $scan - $mode - $stamp"
+}
+
+function New-ArchiveEmailSettingsDefault {
+    return @{
+        Enabled                 = $false
+        To                      = ''
+        From                    = ''
+        Profile                 = 'Custom'
+        SmtpHost                = ''
+        SmtpPort                = 587
+        UseSsl                  = $true
+        UserName                = ''
+        PasswordProtectedBase64 = $null
+    }
+}
+
+function Normalize-SmtpProfileName {
+    param([string]$Raw)
+    if ([string]::IsNullOrWhiteSpace($Raw)) {
+        return 'Custom'
+    }
+    $s = $Raw.Trim()
+    if ($s -match '^(?i)gmail') {
+        return 'GmailAppPassword'
+    }
+    if ($s -match '^(?i)(microsoft365|office365|m365|outlook)') {
+        return 'Microsoft365AppPassword'
+    }
+    if ($s -match '^(?i)smtp2go') {
+        return 'Smtp2Go'
+    }
+    return 'Custom'
+}
+
+function Apply-SmtpPresetToSettings {
+    param(
+        [hashtable]$Settings,
+        [string]$Profile
+    )
+    switch ($Profile) {
+        'GmailAppPassword' {
+            $Settings.SmtpHost = 'smtp.gmail.com'
+            $Settings.SmtpPort = 587
+            $Settings.UseSsl = $true
+        }
+        'Microsoft365AppPassword' {
+            $Settings.SmtpHost = 'smtp.office365.com'
+            $Settings.SmtpPort = 587
+            $Settings.UseSsl = $true
+        }
+        'Smtp2Go' {
+            # SMTP2GO: default port 2525 with STARTTLS (TLS also on 8025, 587, 80, 25). Implicit SSL: 465, 8465, 443.
+            $Settings.SmtpHost = 'mail.smtp2go.com'
+            $Settings.SmtpPort = 2525
+            $Settings.UseSsl = $true
+        }
+        default {
+        }
+    }
+}
+
+function Import-ArchiveEmailFromJsonNode {
+    param($EmailNode)
+    $e = New-ArchiveEmailSettingsDefault
+    if ($null -eq $EmailNode) {
+        return $e
+    }
+    try {
+        if ($null -ne $EmailNode.Enabled) {
+            $e.Enabled = [bool]$EmailNode.Enabled
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$EmailNode.To)) {
+            $e.To = [string]$EmailNode.To.Trim()
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$EmailNode.From)) {
+            $e.From = [string]$EmailNode.From.Trim()
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$EmailNode.Profile)) {
+            $e.Profile = Normalize-SmtpProfileName -Raw ([string]$EmailNode.Profile)
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$EmailNode.SmtpHost)) {
+            $e.SmtpHost = [string]$EmailNode.SmtpHost.Trim()
+        }
+        $portTry = 0
+        if ($null -ne $EmailNode.SmtpPort -and [int]::TryParse([string]$EmailNode.SmtpPort, [ref]$portTry) -and $portTry -gt 0) {
+            $e.SmtpPort = $portTry
+        }
+        if ($null -ne $EmailNode.UseSsl) {
+            $e.UseSsl = [bool]$EmailNode.UseSsl
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$EmailNode.UserName)) {
+            $e.UserName = [string]$EmailNode.UserName.Trim()
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$EmailNode.PasswordProtectedBase64)) {
+            $e.PasswordProtectedBase64 = [string]$EmailNode.PasswordProtectedBase64.Trim()
+        }
+    }
+    catch {
+    }
+    if ($e.Profile -ne 'Custom' -and [string]::IsNullOrWhiteSpace($e.SmtpHost)) {
+        Apply-SmtpPresetToSettings -Settings $e -Profile $e.Profile
+    }
+    if ($e.Profile -eq 'Smtp2Go' -and $e.SmtpPort -eq 587 -and -not [string]::IsNullOrWhiteSpace($e.SmtpHost) -and ($e.SmtpHost.Trim() -ieq 'mail.smtp2go.com')) {
+        $e.SmtpPort = 2525
+    }
+    return $e
+}
+
+function Invoke-ArchiveEmailSetupWizard {
+    param([hashtable]$Seed)
+    $e = New-ArchiveEmailSettingsDefault
+    foreach ($k in $Seed.Keys) {
+        $e[$k] = $Seed[$k]
+    }
+    Write-Host ''
+    Write-Host '--- Email notification (SMTP) ---' -ForegroundColor Cyan
+    Write-Host 'Passwords are stored with Windows DPAPI (CurrentUser) and only work for this user on this computer.' -ForegroundColor DarkGray
+    $en = Read-Host 'Send email when a run completes? [y/N]'
+    if ($en -notmatch '^(y|yes)$') {
+        $e.Enabled = $false
+        return $e
+    }
+    $e.Enabled = $true
+    $defTo = $e.To
+    $r = Read-Host $(if ($defTo) { "To (comma-separated) [$defTo]" } else { 'To (comma-separated addresses)' })
+    $e.To = if ([string]::IsNullOrWhiteSpace($r)) { $defTo } else { $r.Trim() }
+    $defFrom = $e.From
+    $r = Read-Host $(if ($defFrom) { "From [$defFrom]" } else { 'From (sender address)' })
+    $e.From = if ([string]::IsNullOrWhiteSpace($r)) { $defFrom } else { $r.Trim() }
+    Write-Host 'SMTP profile: 1) Gmail (app password)  2) Microsoft 365 / Outlook (app password)  3) SMTP2GO  4) Custom server'
+    $pick = Read-Host 'Choose [1/2/3/4]'
+    if ($pick -eq '2') {
+        $e.Profile = 'Microsoft365AppPassword'
+    }
+    elseif ($pick -eq '3') {
+        $e.Profile = 'Smtp2Go'
+    }
+    elseif ($pick -eq '4') {
+        $e.Profile = 'Custom'
+    }
+    else {
+        $e.Profile = 'GmailAppPassword'
+    }
+    Apply-SmtpPresetToSettings -Settings $e -Profile $e.Profile
+    if ($e.Profile -eq 'Custom') {
+        $r = Read-Host $(if ($e.SmtpHost) { "SMTP host [$($e.SmtpHost)]" } else { 'SMTP host' })
+        if (-not [string]::IsNullOrWhiteSpace($r)) {
+            $e.SmtpHost = $r.Trim()
+        }
+        $r = Read-Host $(if ($e.SmtpPort) { "SMTP port [$($e.SmtpPort)]" } else { 'SMTP port' })
+        $pt = 0
+        if (-not [string]::IsNullOrWhiteSpace($r) -and [int]::TryParse($r, [ref]$pt) -and $pt -gt 0) {
+            $e.SmtpPort = $pt
+        }
+        $r = Read-Host "Use TLS/SSL (recommended for ports 587/2525) [$(if ($e.UseSsl) { 'Y' } else { 'n' })] (y/N)"
+        if ($r -match '^(y|yes)$') {
+            $e.UseSsl = $true
+        }
+        elseif ($r -match '^(n|no)$') {
+            $e.UseSsl = $false
+        }
+    }
+    $defU = $e.UserName
+    $r = Read-Host $(if ($defU) { "SMTP user name (often your mailbox) [$defU]" } else { 'SMTP user name (often your mailbox)' })
+    $e.UserName = if ([string]::IsNullOrWhiteSpace($r)) { $defU } else { $r.Trim() }
+    $sec = Read-Host 'SMTP password or app password' -AsSecureString
+    $plain = ConvertTo-PlainStringFromSecureString -Secure $sec
+    if (-not [string]::IsNullOrWhiteSpace($plain)) {
+        $e.PasswordProtectedBase64 = Protect-ArchiveEmailPassword -PlainText $plain
+    }
+    Write-Host '--- End email setup ---' -ForegroundColor Cyan
+    Write-Host ''
+    return $e
+}
+
+function Merge-ArchiveEmailRuntimeSettings {
+    param(
+        [object]$ConfigRoot,
+        [hashtable]$BoundParameters,
+        [bool]$AllowInteractiveWizard
+    )
+    $emailNode = $null
+    if ($null -ne $ConfigRoot -and $null -ne $ConfigRoot.PSObject.Properties['Email']) {
+        $emailNode = $ConfigRoot.Email
+    }
+    $e = Import-ArchiveEmailFromJsonNode -EmailNode $emailNode
+    if ($BoundParameters.ContainsKey('EmailTo') -and -not [string]::IsNullOrWhiteSpace([string]$BoundParameters['EmailTo'])) {
+        $e.To = [string]$BoundParameters['EmailTo'].Trim()
+        $e.Enabled = $true
+    }
+    if ($BoundParameters.ContainsKey('EmailFrom') -and -not [string]::IsNullOrWhiteSpace([string]$BoundParameters['EmailFrom'])) {
+        $e.From = [string]$BoundParameters['EmailFrom'].Trim()
+    }
+    if ($BoundParameters.ContainsKey('SmtpProfile') -and -not [string]::IsNullOrWhiteSpace([string]$BoundParameters['SmtpProfile'])) {
+        $e.Profile = Normalize-SmtpProfileName -Raw ([string]$BoundParameters['SmtpProfile'])
+        Apply-SmtpPresetToSettings -Settings $e -Profile $e.Profile
+    }
+    if ($BoundParameters.ContainsKey('SmtpHost') -and -not [string]::IsNullOrWhiteSpace([string]$BoundParameters['SmtpHost'])) {
+        $e.SmtpHost = [string]$BoundParameters['SmtpHost'].Trim()
+    }
+    if ($BoundParameters.ContainsKey('SmtpPort') -and -not [string]::IsNullOrWhiteSpace([string]$BoundParameters['SmtpPort'])) {
+        $pt = 0
+        if ([int]::TryParse([string]$BoundParameters['SmtpPort'].Trim(), [ref]$pt) -and $pt -gt 0) {
+            $e.SmtpPort = $pt
+        }
+    }
+    if ($BoundParameters.ContainsKey('SmtpUseSsl') -and -not [string]::IsNullOrWhiteSpace([string]$BoundParameters['SmtpUseSsl'])) {
+        $sx = "$($BoundParameters['SmtpUseSsl'])".Trim()
+        $e.UseSsl = $sx -match '^(?i)y|yes|true|1$'
+    }
+    if ($BoundParameters.ContainsKey('SmtpUser') -and -not [string]::IsNullOrWhiteSpace([string]$BoundParameters['SmtpUser'])) {
+        $e.UserName = [string]$BoundParameters['SmtpUser'].Trim()
+    }
+    if ($AllowInteractiveWizard) {
+        if (-not $e.Enabled -or [string]::IsNullOrWhiteSpace($e.PasswordProtectedBase64)) {
+            $ask = Read-Host 'Set up SMTP email notifications (saved to config)? [y/N]'
+        }
+        else {
+            $ask = Read-Host 'Change SMTP email settings? [y/N]'
+        }
+        if ($ask -match '^(y|yes)$') {
+            $e = Invoke-ArchiveEmailSetupWizard -Seed $e
+        }
+    }
+    if ($e.Enabled) {
+        if ([string]::IsNullOrWhiteSpace($e.To) -or [string]::IsNullOrWhiteSpace($e.From)) {
+            Write-Warning 'Email is enabled but To or From is missing; disabling email for this run.'
+            $e.Enabled = $false
+        }
+        if ([string]::IsNullOrWhiteSpace($e.SmtpHost)) {
+            Write-Warning 'Email is enabled but SmtpHost is missing; disabling email for this run.'
+            $e.Enabled = $false
+        }
+        if ([string]::IsNullOrWhiteSpace($e.PasswordProtectedBase64)) {
+            Write-Warning 'Email is enabled but no saved SMTP password; run interactive setup or disable Email.'
+            $e.Enabled = $false
+        }
+    }
+    return $e
+}
+
+function Get-ResolvedSmtpAuthUserName {
+    param([hashtable]$EmailSettings)
+    if (-not [string]::IsNullOrWhiteSpace($EmailSettings.UserName)) {
+        return $EmailSettings.UserName.Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($EmailSettings.From)) {
+        return ''
+    }
+    try {
+        $ma = New-Object System.Net.Mail.MailAddress($EmailSettings.From.Trim())
+        return $ma.Address
+    }
+    catch {
+        return ''
+    }
+}
+
+function Send-ArchiveOldFilesEmail {
+    param(
+        [hashtable]$EmailSettings,
+        [string]$Subject,
+        [string]$Body,
+        [string[]]$AttachmentPaths
+    )
+    $plainPass = Unprotect-ArchiveEmailPassword -Base64 $EmailSettings.PasswordProtectedBase64
+    if ([string]::IsNullOrWhiteSpace($plainPass)) {
+        throw 'SMTP password missing or could not be decrypted.'
+    }
+    $smtpAuthUser = Get-ResolvedSmtpAuthUserName -EmailSettings $EmailSettings
+    if ([string]::IsNullOrWhiteSpace($smtpAuthUser)) {
+        throw 'SMTP login user is missing. Set Email.UserName (SMTP2GO SMTP user) or use From as a valid email address; relay servers reject unauthenticated clients.'
+    }
+    $msg = New-Object System.Net.Mail.MailMessage
+    try {
+        $msg.From = New-Object System.Net.Mail.MailAddress($EmailSettings.From.Trim())
+        foreach ($addr in ($EmailSettings.To -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            $null = $msg.To.Add($addr)
+        }
+        $msg.Subject = $Subject
+        $msg.Body = $Body
+        $msg.IsBodyHtml = $false
+        foreach ($ap in $AttachmentPaths) {
+            if (-not [string]::IsNullOrWhiteSpace($ap) -and (Test-Path -LiteralPath $ap)) {
+                $null = $msg.Attachments.Add((New-Object System.Net.Mail.Attachment($ap)))
+            }
+        }
+        $smtp = New-Object System.Net.Mail.SmtpClient($EmailSettings.SmtpHost.Trim(), [int]$EmailSettings.SmtpPort)
+        try {
+            $smtp.EnableSsl = [bool]$EmailSettings.UseSsl
+            $smtp.Credentials = New-Object System.Net.NetworkCredential($smtpAuthUser, $plainPass)
+            $smtp.Send($msg)
+        }
+        finally {
+            $smtp.Dispose()
+        }
+    }
+    finally {
+        $msg.Dispose()
+    }
+}
+
 function Test-SingleConfigValidity {
     param(
         [string]$InputPath,
@@ -460,7 +901,8 @@ function Show-SavedConfigSummary {
         [object]$Output,
         [object]$RemoveEmptyFolders,
         [string]$ArchiveShareNameHint = '',
-        [string]$AgeBasis = 'LastWriteTime'
+        [string]$AgeBasis = 'LastWriteTime',
+        [string]$EmailStatus = ''
     )
     Write-Host ''
     Write-Host '--- Saved / current configuration ---' -ForegroundColor Cyan
@@ -474,8 +916,26 @@ function Show-SavedConfigSummary {
     Write-Host "  Commit           : $DoCommit"
     Write-Host ('  Output           : {0}' -f ($(if ($null -ne $Output -and $Output -ne '') { $Output } else { '(prompt at end)' })))
     Write-Host ('  RemoveEmptyFldrs : {0}' -f ($(if ($null -ne $RemoveEmptyFolders -and $RemoveEmptyFolders -ne '') { $RemoveEmptyFolders } else { '(prompt if commit)' })))
+    if (-not [string]::IsNullOrWhiteSpace($EmailStatus)) {
+        Write-Host "  Email            : $EmailStatus"
+    }
     Write-Host '-------------------------------------' -ForegroundColor Cyan
     Write-Host ''
+}
+
+function Get-ArchiveEmailStatusSummary {
+    param([object]$SavedRoot)
+    if ($null -eq $SavedRoot -or -not ($SavedRoot.PSObject.Properties.Name -contains 'Email') -or $null -eq $SavedRoot.Email) {
+        return '(not configured)'
+    }
+    try {
+        if ([bool]$SavedRoot.Email.Enabled) {
+            return 'On (saved SMTP + DPAPI password)'
+        }
+    }
+    catch {
+    }
+    return 'Off'
 }
 
 function Get-ResolvedPath {
@@ -1296,6 +1756,61 @@ function Invoke-SingleArchiveJob {
 
 $configFile = if ($ConfigPath) { $ConfigPath } else { Get-DefaultConfigPath }
 
+if ($testEmailFlag) {
+    $snapTest = Read-SavedConfigFromDisk -Path $configFile
+    $emailBoundTest = @{}
+    foreach ($ek in @('EmailTo', 'EmailFrom', 'SmtpProfile', 'SmtpHost', 'SmtpPort', 'SmtpUseSsl', 'SmtpUser')) {
+        if ($PSBoundParameters.ContainsKey($ek)) {
+            $emailBoundTest[$ek] = $PSBoundParameters[$ek]
+        }
+    }
+    $rtEmail = Merge-ArchiveEmailRuntimeSettings -ConfigRoot $snapTest -BoundParameters $emailBoundTest -AllowInteractiveWizard $false
+    $testFails = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($rtEmail['To'])) {
+        $null = $testFails.Add('Recipient (To) is missing; set Email.To in the JSON config or pass -EmailTo.')
+    }
+    if ([string]::IsNullOrWhiteSpace($rtEmail['From'])) {
+        $null = $testFails.Add('From is missing; set Email.From in the JSON config or pass -EmailFrom.')
+    }
+    if ([string]::IsNullOrWhiteSpace($rtEmail['SmtpHost'])) {
+        $null = $testFails.Add('SMTP host is missing; set profile/host in the JSON config or pass -SmtpHost.')
+    }
+    if ([string]::IsNullOrWhiteSpace($rtEmail['PasswordProtectedBase64'])) {
+        $null = $testFails.Add('SMTP password is missing; run the script once without -TestEmail and complete the email wizard, or restore Email.PasswordProtectedBase64 in the JSON.')
+    }
+    $resolvedTestUser = Get-ResolvedSmtpAuthUserName -EmailSettings $rtEmail
+    if ([string]::IsNullOrWhiteSpace($resolvedTestUser)) {
+        $null = $testFails.Add('SMTP login user is missing; set Email.UserName or pass -SmtpUser (SMTP2GO SMTP user from the dashboard), or set From to a valid email address.')
+    }
+    if ($testFails.Count -gt 0) {
+        Write-Error ("Cannot send test email:`n- " + ($testFails -join "`n- "))
+        exit 1
+    }
+    $domTest = Get-ReportDomainLabelForFilename
+    $subjTest = '[Archive Old Files] SMTP test - {0} (v{1})' -f $domTest, $script:Version
+    $authUserTest = $resolvedTestUser
+    if ([string]::IsNullOrWhiteSpace($rtEmail['UserName']) -and -not [string]::IsNullOrWhiteSpace($authUserTest)) {
+        $authUserTest = '{0} (From address used as SMTP login)' -f $authUserTest
+    }
+    $bodyTest = @(
+        'This is a test message from Archive-OldFiles.ps1 -TestEmail.',
+        "Computer: $env:COMPUTERNAME",
+        ('SMTP: {0}:{1}  TLS(STARTTLS or as negotiated): {2}  Auth user: {3}' -f $rtEmail['SmtpHost'], $rtEmail['SmtpPort'], $rtEmail['UseSsl'], $authUserTest),
+        "Config file: $configFile",
+        '',
+        'If this message arrived, SMTP settings are working for this Windows user on this machine.'
+    ) -join [Environment]::NewLine
+    try {
+        Send-ArchiveOldFilesEmail -EmailSettings $rtEmail -Subject $subjTest -Body $bodyTest -AttachmentPaths @()
+        Write-Host ('Test email sent to {0}.' -f $rtEmail['To']) -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Test email failed: $($_.Exception.Message)"
+        exit 1
+    }
+    exit 0
+}
+
 $coreProvidedOnCli = (-not [string]::IsNullOrWhiteSpace("$ArchivePath")) -and
 (-not [string]::IsNullOrWhiteSpace("$Years")) -and ($yrs -gt 0) -and (
     $allSharesFlag -or ((-not [string]::IsNullOrWhiteSpace("$InputPath")))
@@ -1388,7 +1903,7 @@ else {
                 $savedAgeHint = $tryAb
             }
         }
-        Show-SavedConfigSummary -InputPath $saved.InputPath -ArchivePath $saved.ArchivePath -Years ([double]$saved.Years) -DoCommit ([bool]$saved.Commit) -Output $saved.Output -RemoveEmptyFolders $saved.RemoveEmptyFolders -ArchiveShareNameHint $archShareHint -AgeBasis $savedAgeHint
+        Show-SavedConfigSummary -InputPath $saved.InputPath -ArchivePath $saved.ArchivePath -Years ([double]$saved.Years) -DoCommit ([bool]$saved.Commit) -Output $saved.Output -RemoveEmptyFolders $saved.RemoveEmptyFolders -ArchiveShareNameHint $archShareHint -AgeBasis $savedAgeHint -EmailStatus (Get-ArchiveEmailStatusSummary -SavedRoot $saved)
         $ans = Read-Host 'Use these saved values (you will fix any that are invalid next)? [Y/n]'
         if ($ans -notmatch '^(n|no)$') {
             $useSaved = $true
@@ -1678,6 +2193,15 @@ if ($allSharesFlag) {
     $outPref = 'HTML'
 }
 
+$configSnapshotForEmail = Read-SavedConfigFromDisk -Path $configFile
+$emailBoundArgs = @{}
+foreach ($ek in @('EmailTo', 'EmailFrom', 'SmtpProfile', 'SmtpHost', 'SmtpPort', 'SmtpUseSsl', 'SmtpUser')) {
+    if ($PSBoundParameters.ContainsKey($ek)) {
+        $emailBoundArgs[$ek] = $PSBoundParameters[$ek]
+    }
+}
+$ArchiveEmailRuntime = Merge-ArchiveEmailRuntimeSettings -ConfigRoot $configSnapshotForEmail -BoundParameters $emailBoundArgs -AllowInteractiveWizard (-not $coreProvidedOnCli)
+
 # --- Main: one Invoke-SingleArchiveJob call, or -All loop (preview-only, HTML per share) ---
 
 if ($allSharesFlag) {
@@ -1836,7 +2360,7 @@ else {
 if (-not $noSaveConfigFlag) {
     try {
         $payload = [ordered]@{
-            SchemaVersion      = 1
+            SchemaVersion      = 2
             ScriptVersion      = $script:Version
             SavedAt            = (Get-Date).ToString('o')
             InputPath          = $InputPath
@@ -1848,8 +2372,19 @@ if (-not $noSaveConfigFlag) {
             Output             = $outFormat
             RemoveEmptyFolders = $(if ($null -ne $removeEmptyChoice) { $removeEmptyChoice } else { $null })
             AllShares          = [bool]$allSharesFlag
+            Email              = [ordered]@{
+                Enabled                 = [bool]$ArchiveEmailRuntime['Enabled']
+                To                      = [string]$ArchiveEmailRuntime['To']
+                From                    = [string]$ArchiveEmailRuntime['From']
+                Profile                 = [string]$ArchiveEmailRuntime['Profile']
+                SmtpHost                = [string]$ArchiveEmailRuntime['SmtpHost']
+                SmtpPort                = [int]$ArchiveEmailRuntime['SmtpPort']
+                UseSsl                  = [bool]$ArchiveEmailRuntime['UseSsl']
+                UserName                = [string]$ArchiveEmailRuntime['UserName']
+                PasswordProtectedBase64 = $ArchiveEmailRuntime['PasswordProtectedBase64']
+            }
         }
-        $json = $payload | ConvertTo-Json -Depth 4
+        $json = $payload | ConvertTo-Json -Depth 6
         Set-Content -LiteralPath $configFile -Value $json -Encoding UTF8 -Force
         Write-Host "Saved settings for next run: $configFile" -ForegroundColor Green
     }
@@ -1913,6 +2448,49 @@ if (-not $noRunLogFlag) {
     }
     catch {
         Write-Warning "Could not write run log: $($_.Exception.Message)"
+    }
+}
+
+if (-not $noSendEmailFlag -and $ArchiveEmailRuntime['Enabled']) {
+    try {
+        $domainLbl = Get-ReportDomainLabelForFilename
+        $scanLbl = Get-ArchiveEmailScanLabel -InputResolved $inputResolved -AllSharesMode $allSharesFlag
+        $subj = Get-ArchiveEmailAutoSubject -DomainLabel $domainLbl -ScanLabel $scanLbl -CommitMode $doCommit
+        $attachList = New-Object System.Collections.Generic.List[string]
+        if ($allSharesFlag) {
+            foreach ($hp in $allHtmlPaths) {
+                if (-not [string]::IsNullOrWhiteSpace($hp) -and (Test-Path -LiteralPath $hp)) {
+                    $null = $attachList.Add($hp)
+                }
+            }
+        }
+        elseif ($outFormat -eq 'HTML' -and -not [string]::IsNullOrWhiteSpace($htmlReportOutPath) -and (Test-Path -LiteralPath $htmlReportOutPath)) {
+            $null = $attachList.Add($htmlReportOutPath)
+        }
+        $listedSum = if ($allSharesFlag) { $listedForArchiveAll } else { @($results).Count }
+        $pmSum = if ($allSharesFlag) { $plannedMovedCountAgg } else { @($plannedMovedRows).Count }
+        $fSum = if ($allSharesFlag) { $failedCountAgg } else { @($failedRows).Count }
+        $bodyLines = @(
+            "Archive Old Files (v$($script:Version))",
+            "Computer: $env:COMPUTERNAME",
+            "Domain label: $domainLbl",
+            "Input / scan: $inputResolved",
+            "Archive: $archiveResolved",
+            "Years: $yrs  AgeBasis: $ageBasisEffective  Output: $outFormat  Commit: $doCommit",
+            "Files scanned (all ages): $fileScanCount",
+            "Met age rule (listed): $listedSum",
+            "Planned+Moved: $pmSum  Failed: $fSum",
+            "Reclaim (Planned+Moved): $reclaimDisplay"
+        )
+        if ($attachList.Count -eq 0) {
+            $bodyLines += '(No HTML file attached for this run.)'
+        }
+        $bodyText = $bodyLines -join [Environment]::NewLine
+        Send-ArchiveOldFilesEmail -EmailSettings $ArchiveEmailRuntime -Subject $subj -Body $bodyText -AttachmentPaths @($attachList.ToArray())
+        Write-Host ('Email sent to {0}' -f $ArchiveEmailRuntime['To']) -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Email send failed: $($_.Exception.Message)"
     }
 }
 

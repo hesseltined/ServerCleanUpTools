@@ -2,6 +2,12 @@
 
 Windows PowerShell utilities for server and share maintenance.
 
+## Archive-OldFiles (Rust)
+
+Native Windows binary port lives in **`archive-old-files/`** (Cargo crate `archive-old-files`). It reads/writes the same **`Archive-OldFiles.config.json`** and run log as the PowerShell script. On a Mac, use **`archive-old-files/setup-cross-compile.sh`** (installs **Homebrew LLVM**, **llvm-tools**, **cargo-xwin**, then runs **`cargo xwin build`**). See **`archive-old-files/README.md`** for prerequisites and manual steps.
+
+Run on Windows: `archive-old-files.exe --help` (or pass `--input`, `--archive`, `--years`, etc.). Interactive prompts use the terminal when required options are omitted.
+
 ## Archive-OldFiles.ps1
 
 Recursively finds files older than a chosen number of years (by last modified time), then **plans** or **moves** them to a separate archive location while **mirroring** the folder structure. Defaults to **preview-only** so you can review actions before committing.
