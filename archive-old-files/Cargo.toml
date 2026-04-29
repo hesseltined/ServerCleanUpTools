@@ -1,0 +1,42 @@
+# Purpose: Age-based file archival (Rust port of Archive-OldFiles.ps1).
+# Author: Doug Hesseltine
+# Version: managed via Cargo.toml / CARGO_PKG_VERSION
+
+[package]
+name = "archive-old-files"
+version = "2.0.0"
+edition = "2021"
+authors = ["Doug Hesseltine"]
+description = "Finds files older than N years and plans or moves them to an archive root with mirrored paths."
+default-run = "archive-old-files"
+
+[[bin]]
+name = "archive-old-files"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dialoguer = "0.11"
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "builder",
+    "native-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+walkdir = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+] }
+wmi = "0.13"
