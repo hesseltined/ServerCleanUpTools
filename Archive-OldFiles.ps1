@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Finds files older than N years under an input folder and plans or moves them to an archive root with mirrored paths.
+    Finds files older than N years under an input folder and plans or moves them to an archive root under a share-named folder with mirrored paths.
 
 .DESCRIPTION
     By default runs in preview mode: no files are moved and no folders are created on the archive.
@@ -15,6 +15,8 @@
     After a successful run, settings are saved to Archive-OldFiles.config.json next to the script (unless -NoSaveConfig).
     Optional email after each run: recipients, From, and SMTP (Gmail / Microsoft 365 presets or custom) are saved under Email in that JSON;
     the SMTP password is protected with Windows DPAPI (CurrentUser) and only decrypts for the same Windows user on the same machine.
+    When you change email interactively, To/From, SMTP server (profile/host/port/TLS), and login/password are separate steps; prompts default to saved values (Enter keeps them).
+    The saved password is not re-prompted unless you choose to change SMTP login/password (blank password keeps the existing secret).
     Each run also appends a short summary to Archive-OldFiles.run.log in the same folder (unless -NoRunLog).
     Optional HTML reports are written under the archive path; the file name includes computer/AD domain, the scanned path, and a timestamp.
     Use -All on a file server to preview every published folder share (HTML per share, never -Commit). Owner column resolves SIDs; unresolved or deleted accounts show as "No active user".
@@ -32,7 +34,8 @@
     Perform Move-Item and create destination directories.
 
 .PARAMETER Output
-    Text or HTML. HTML writes a formatted report under the archive folder. If omitted, you are prompted at the end (unless saved in config).
+    Text or HTML for on-screen detail display. A formatted HTML report is always saved next to this script for each run.
+    If omitted, you are prompted at the end (unless saved in config).
 
 .PARAMETER RemoveEmptyFolders
     Yes or No after -Commit. If omitted, you are prompted (unless saved in config).
@@ -62,6 +65,16 @@
     Scan every published disk share on this computer (same rules as the share picker: Type 0, no trailing $ in name).
     Always runs in preview mode: no moves are performed even if -Commit or saved JSON says commit. Implies HTML output:
     one report file per share under ArchivePath. InputPath is ignored. Requires ArchivePath and Years (from parameters or saved config).
+
+.PARAMETER ExcludeFolders
+    Comma-separated list of folder paths to exclude from scanning and from copy/move actions.
+    Values can be absolute (e.g. `D:\Data\Temp` or `\\server\share\Temp`) or relative to InputPath (e.g. `Subfolder`).
+    Saved to JSON so the same excludes apply on future runs.
+
+.PARAMETER TestMove
+    Alias: `-test`.
+    Test mode (copy-only): copies the files selected by the age rule into the archive but does not delete from the source.
+    Saved to JSON and intended as the second step after a non-commit report, before a final -Commit move.
 
 .PARAMETER EmailTo
     Comma-separated recipient addresses. Merged with saved Email settings (SMTP host, encrypted password, etc.).
@@ -97,14 +110,14 @@
     Purpose: Age-based archival of old files to a separate archive location.
     Author: Doug Hesseltine
     Created: 2026-03-27
-    Modified: 2026-03-27
-    Version: 1.8.4
+    Modified: 2026-03-30
+    Version: 1.9.3
 
     Troubleshooting (if the script will not run):
     - After downloading from the web, run: Unblock-File -Path .\Archive-OldFiles.ps1
     - Run explicitly: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Archive-OldFiles.ps1 -InputPath '...' -ArchivePath '...' -Years N
     - Ensure the file is named Archive-OldFiles.ps1 (not .txt). On Windows PowerShell 5.1, save as UTF-8 with BOM if you edit the script and see ParserError or garbled punctuation (em dashes and similar can break without BOM).
-    - Settings: Archive-OldFiles.config.json next to the script. Run summary: Archive-OldFiles.run.log (same folder). HTML reports: archive root when you choose HTML.
+    - Settings: Archive-OldFiles.config.json next to the script. Run summary: Archive-OldFiles.run.log (same folder). HTML reports: saved next to the script for every run.
     - ParserError (Unexpected token '}') after editing: replace the file with a full fresh copy from source; truncated saves break the script mid-block.
     - -All: use -All with no value (switch). Older copies used an untyped -All parameter and required -All:$true; update to v1.7.1+.
 
@@ -156,6 +169,7 @@ param(
     $ArchivePath,
     $Years,
     $Commit,
+    $ExcludeFolders,
     $Output,
     $RemoveEmptyFolders,
     $ConfigPath,
@@ -173,7 +187,8 @@ param(
     $SmtpUseSsl,
     $SmtpUser,
     [switch]$NoSendEmail,
-    [switch]$TestEmail
+    [switch]$TestEmail,
+    [Alias('test')][switch]$TestMove
 )
 
 if ($PSVersionTable.PSVersion.Major -lt 5) {
@@ -325,10 +340,20 @@ $noRunLogFlag = ConvertTo-BoundBool $NoRunLog
 $noSendEmailFlag = $NoSendEmail.IsPresent
 $allSharesFlag = $All.IsPresent
 $testEmailFlag = $TestEmail.IsPresent
+$testMoveFlag = $TestMove.IsPresent
 
 $ErrorActionPreference = 'Stop'
 
-$script:Version = '1.8.4'
+$script:Version = '1.9.3'
+$script:ScriptHome = if ($PSScriptRoot) {
+    $PSScriptRoot
+}
+elseif ($MyInvocation.MyCommand.Path) {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+else {
+    (Get-Location).Path
+}
 
 function Get-DefaultConfigPath {
     if ($PSScriptRoot) {
@@ -414,6 +439,63 @@ function Get-LocalPathForShareName {
         return $s.Path.TrimEnd('\')
     }
     return $null
+}
+
+function Get-ShareNameForLocalPath {
+    param([string]$LocalPath)
+    if ([string]::IsNullOrWhiteSpace($LocalPath)) {
+        return ''
+    }
+    $pathNorm = $LocalPath.Trim().TrimEnd('\')
+    try {
+        foreach ($s in @(Get-PublishedDiskShares)) {
+            if ($null -eq $s) {
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$s.LocalPath)) {
+                continue
+            }
+            if ($s.LocalPath.TrimEnd('\') -ieq $pathNorm) {
+                return [string]$s.Name
+            }
+        }
+    }
+    catch {
+    }
+    return ''
+}
+
+function Get-ArchiveDestinationRootForInput {
+    param(
+        [string]$ArchiveResolved,
+        [string]$InputResolved,
+        [string]$ShareNameLabel = ''
+    )
+    $shareFolder = ''
+    if (-not [string]::IsNullOrWhiteSpace($ShareNameLabel)) {
+        $shareFolder = $ShareNameLabel.Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($shareFolder)) {
+        $shareFolder = Get-ShareNameForLocalPath -LocalPath $InputResolved
+    }
+    if ([string]::IsNullOrWhiteSpace($shareFolder)) {
+        $shareFolder = Split-Path -Leaf $InputResolved.TrimEnd('\')
+    }
+    if ([string]::IsNullOrWhiteSpace($shareFolder)) {
+        $shareFolder = 'Source'
+    }
+    foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) {
+        $shareFolder = $shareFolder.Replace([string]$c, '_')
+    }
+    $shareFolder = $shareFolder.Trim().Trim('.')
+    if ([string]::IsNullOrWhiteSpace($shareFolder)) {
+        $shareFolder = 'Source'
+    }
+    $archiveLeaf = Split-Path -Leaf $ArchiveResolved.TrimEnd('\')
+    if (-not [string]::IsNullOrWhiteSpace($archiveLeaf) -and $archiveLeaf -ieq $shareFolder) {
+        return $ArchiveResolved.TrimEnd('\')
+    }
+    return (Join-Path $ArchiveResolved $shareFolder)
 }
 
 function Invoke-InputPathShareMenu {
@@ -550,11 +632,20 @@ function Get-ArchiveEmailAutoSubject {
     param(
         [string]$DomainLabel,
         [string]$ScanLabel,
-        [bool]$CommitMode
+        [bool]$CommitMode,
+        [bool]$TestCopyMode = $false
     )
     $dom = if ([string]::IsNullOrWhiteSpace($DomainLabel)) { 'NODOMAIN' } else { $DomainLabel.Trim() }
     $scan = if ([string]::IsNullOrWhiteSpace($ScanLabel)) { 'Scan' } else { $ScanLabel.Trim() }
-    $mode = if ($CommitMode) { 'Commit' } else { 'Preview' }
+    if ($TestCopyMode) {
+        $mode = 'TestCopy'
+    }
+    elseif ($CommitMode) {
+        $mode = 'Commit'
+    }
+    else {
+        $mode = 'Preview'
+    }
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
     return "[Archive-OldFiles] $dom - $scan - $mode - $stamp"
 }
@@ -665,69 +756,159 @@ function Import-ArchiveEmailFromJsonNode {
     return $e
 }
 
-function Invoke-ArchiveEmailSetupWizard {
+function Copy-ArchiveEmailSettingsFromSeed {
     param([hashtable]$Seed)
     $e = New-ArchiveEmailSettingsDefault
     foreach ($k in $Seed.Keys) {
         $e[$k] = $Seed[$k]
     }
+    return $e
+}
+
+function Edit-ArchiveEmailToFrom {
+    param([hashtable]$EmailSettings)
     Write-Host ''
-    Write-Host '--- Email notification (SMTP) ---' -ForegroundColor Cyan
-    Write-Host 'Passwords are stored with Windows DPAPI (CurrentUser) and only work for this user on this computer.' -ForegroundColor DarkGray
-    $en = Read-Host 'Send email when a run completes? [y/N]'
-    if ($en -notmatch '^(y|yes)$') {
-        $e.Enabled = $false
-        return $e
-    }
-    $e.Enabled = $true
-    $defTo = $e.To
+    Write-Host '--- To / From ---' -ForegroundColor Cyan
+    $defTo = $EmailSettings.To
     $r = Read-Host $(if ($defTo) { "To (comma-separated) [$defTo]" } else { 'To (comma-separated addresses)' })
-    $e.To = if ([string]::IsNullOrWhiteSpace($r)) { $defTo } else { $r.Trim() }
-    $defFrom = $e.From
-    $r = Read-Host $(if ($defFrom) { "From [$defFrom]" } else { 'From (sender address)' })
-    $e.From = if ([string]::IsNullOrWhiteSpace($r)) { $defFrom } else { $r.Trim() }
-    Write-Host 'SMTP profile: 1) Gmail (app password)  2) Microsoft 365 / Outlook (app password)  3) SMTP2GO  4) Custom server'
-    $pick = Read-Host 'Choose [1/2/3/4]'
-    if ($pick -eq '2') {
-        $e.Profile = 'Microsoft365AppPassword'
+    $EmailSettings.To = if ([string]::IsNullOrWhiteSpace($r)) { $defTo } else { $r.Trim() }
+    $defFrom = $EmailSettings.From
+    $r = Read-Host $(if ($defFrom) { "From (sender) [$defFrom]" } else { 'From (sender address)' })
+    $EmailSettings.From = if ([string]::IsNullOrWhiteSpace($r)) { $defFrom } else { $r.Trim() }
+    Write-Host '--- End To/From ---' -ForegroundColor Cyan
+}
+
+function Edit-ArchiveEmailSmtpServer {
+    param([hashtable]$EmailSettings)
+    Write-Host ''
+    Write-Host '--- SMTP server (profile, host, port, TLS) ---' -ForegroundColor Cyan
+    Write-Host 'Password is not changed here; use the login/password option if you need a new app password.' -ForegroundColor DarkGray
+    $profHint = switch ($EmailSettings.Profile) {
+        'Microsoft365AppPassword' { '2' }
+        'Smtp2Go' { '3' }
+        'Custom' { '4' }
+        Default { '1' }
     }
-    elseif ($pick -eq '3') {
-        $e.Profile = 'Smtp2Go'
-    }
-    elseif ($pick -eq '4') {
-        $e.Profile = 'Custom'
-    }
-    else {
-        $e.Profile = 'GmailAppPassword'
-    }
-    Apply-SmtpPresetToSettings -Settings $e -Profile $e.Profile
-    if ($e.Profile -eq 'Custom') {
-        $r = Read-Host $(if ($e.SmtpHost) { "SMTP host [$($e.SmtpHost)]" } else { 'SMTP host' })
-        if (-not [string]::IsNullOrWhiteSpace($r)) {
-            $e.SmtpHost = $r.Trim()
+    Write-Host "Current: profile=$($EmailSettings.Profile)  host=$($EmailSettings.SmtpHost)  port=$($EmailSettings.SmtpPort)  TLS=$($EmailSettings.UseSsl)" -ForegroundColor DarkGray
+    Write-Host 'SMTP profile: 1) Gmail (app password)  2) Microsoft 365 / Outlook  3) SMTP2GO  4) Custom server'
+    $pick = Read-Host "Choose [1/2/3/4] or Enter to keep profile [$profHint]"
+    if (-not [string]::IsNullOrWhiteSpace($pick)) {
+        if ($pick -eq '2') {
+            $EmailSettings.Profile = 'Microsoft365AppPassword'
         }
-        $r = Read-Host $(if ($e.SmtpPort) { "SMTP port [$($e.SmtpPort)]" } else { 'SMTP port' })
+        elseif ($pick -eq '3') {
+            $EmailSettings.Profile = 'Smtp2Go'
+        }
+        elseif ($pick -eq '4') {
+            $EmailSettings.Profile = 'Custom'
+        }
+        else {
+            $EmailSettings.Profile = 'GmailAppPassword'
+        }
+        Apply-SmtpPresetToSettings -Settings $EmailSettings -Profile $EmailSettings.Profile
+    }
+    if ($EmailSettings.Profile -eq 'Custom') {
+        $r = Read-Host $(if ($EmailSettings.SmtpHost) { "SMTP host [$($EmailSettings.SmtpHost)]" } else { 'SMTP host' })
+        if (-not [string]::IsNullOrWhiteSpace($r)) {
+            $EmailSettings.SmtpHost = $r.Trim()
+        }
+        $r = Read-Host $(if ($EmailSettings.SmtpPort) { "SMTP port [$($EmailSettings.SmtpPort)]" } else { 'SMTP port' })
         $pt = 0
         if (-not [string]::IsNullOrWhiteSpace($r) -and [int]::TryParse($r, [ref]$pt) -and $pt -gt 0) {
-            $e.SmtpPort = $pt
+            $EmailSettings.SmtpPort = $pt
         }
-        $r = Read-Host "Use TLS/SSL (recommended for ports 587/2525) [$(if ($e.UseSsl) { 'Y' } else { 'n' })] (y/N)"
+        $r = Read-Host "Use TLS/SSL (recommended for ports 587/2525) [$(if ($EmailSettings.UseSsl) { 'Y' } else { 'n' })] (y/N)"
         if ($r -match '^(y|yes)$') {
-            $e.UseSsl = $true
+            $EmailSettings.UseSsl = $true
         }
         elseif ($r -match '^(n|no)$') {
-            $e.UseSsl = $false
+            $EmailSettings.UseSsl = $false
         }
     }
-    $defU = $e.UserName
+    Write-Host '--- End SMTP server ---' -ForegroundColor Cyan
+}
+
+function Edit-ArchiveEmailCredentials {
+    param(
+        [hashtable]$EmailSettings,
+        [switch]$RequirePasswordIfMissing
+    )
+    Write-Host ''
+    Write-Host '--- SMTP login and password ---' -ForegroundColor Cyan
+    Write-Host 'Passwords are stored with Windows DPAPI (CurrentUser) and only work for this user on this computer.' -ForegroundColor DarkGray
+    $defU = $EmailSettings.UserName
     $r = Read-Host $(if ($defU) { "SMTP user name (often your mailbox) [$defU]" } else { 'SMTP user name (often your mailbox)' })
-    $e.UserName = if ([string]::IsNullOrWhiteSpace($r)) { $defU } else { $r.Trim() }
+    $EmailSettings.UserName = if ([string]::IsNullOrWhiteSpace($r)) { $defU } else { $r.Trim() }
+    $hasSaved = -not [string]::IsNullOrWhiteSpace($EmailSettings.PasswordProtectedBase64)
+    if ($hasSaved) {
+        Write-Host 'Leave password blank (press Enter) to keep the saved app password.' -ForegroundColor DarkGray
+    }
+    elseif ($RequirePasswordIfMissing) {
+        Write-Host 'Enter the SMTP or app password (required the first time email is enabled).' -ForegroundColor DarkGray
+    }
     $sec = Read-Host 'SMTP password or app password' -AsSecureString
     $plain = ConvertTo-PlainStringFromSecureString -Secure $sec
     if (-not [string]::IsNullOrWhiteSpace($plain)) {
-        $e.PasswordProtectedBase64 = Protect-ArchiveEmailPassword -PlainText $plain
+        $EmailSettings.PasswordProtectedBase64 = Protect-ArchiveEmailPassword -PlainText $plain
     }
+    elseif (-not $hasSaved -and $RequirePasswordIfMissing) {
+        Write-Warning 'No password was entered. Email will stay disabled until you save a password (run setup again).'
+    }
+    Write-Host '--- End SMTP login ---' -ForegroundColor Cyan
+}
+
+function Invoke-ArchiveEmailFirstTimeSetup {
+    param([hashtable]$Seed)
+    $e = Copy-ArchiveEmailSettingsFromSeed -Seed $Seed
+    Write-Host ''
+    Write-Host '--- Email notification (SMTP) - first-time setup ---' -ForegroundColor Cyan
+    $en = Read-Host 'Send email when a run completes? [y/N]'
+    if ($en -notmatch '^(y|yes)$') {
+        $e.Enabled = $false
+        Write-Host ''
+        return $e
+    }
+    $e.Enabled = $true
+    Edit-ArchiveEmailToFrom -EmailSettings $e
+    Edit-ArchiveEmailSmtpServer -EmailSettings $e
+    Edit-ArchiveEmailCredentials -EmailSettings $e -RequirePasswordIfMissing
+    if ($e.Enabled -and [string]::IsNullOrWhiteSpace($e.PasswordProtectedBase64)) {
+        Write-Warning 'No SMTP password is saved; email notifications remain off until you complete setup with a password.'
+        $e.Enabled = $false
+    }
+    Write-Host ''
     Write-Host '--- End email setup ---' -ForegroundColor Cyan
+    return $e
+}
+
+function Invoke-ArchiveEmailInteractiveChange {
+    param([hashtable]$Seed)
+    $e = Copy-ArchiveEmailSettingsFromSeed -Seed $Seed
+    Write-Host ''
+    Write-Host '--- Change email settings ---' -ForegroundColor Cyan
+    Write-Host 'Pick what to edit. You can choose more than one in a row; press Enter on an empty choice when done.' -ForegroundColor DarkGray
+    Write-Host '  1 = To / From (addresses; Enter at each prompt keeps the current value)' -ForegroundColor DarkGray
+    Write-Host '  2 = SMTP server (profile, host, port, TLS) - does not ask for password' -ForegroundColor DarkGray
+    Write-Host '  3 = SMTP login name and password (blank password keeps the saved secret)' -ForegroundColor DarkGray
+    while ($true) {
+        $c = (Read-Host 'Choice [1 / 2 / 3, or Enter=done]').Trim()
+        if ([string]::IsNullOrWhiteSpace($c)) {
+            break
+        }
+        if ($c -eq '1') {
+            Edit-ArchiveEmailToFrom -EmailSettings $e
+        }
+        elseif ($c -eq '2') {
+            Edit-ArchiveEmailSmtpServer -EmailSettings $e
+        }
+        elseif ($c -eq '3') {
+            Edit-ArchiveEmailCredentials -EmailSettings $e
+        }
+        else {
+            Write-Host 'Use 1, 2, 3, or Enter to finish.' -ForegroundColor Yellow
+        }
+    }
+    Write-Host '--- Done changing email settings ---' -ForegroundColor Cyan
     Write-Host ''
     return $e
 }
@@ -771,14 +952,18 @@ function Merge-ArchiveEmailRuntimeSettings {
         $e.UserName = [string]$BoundParameters['SmtpUser'].Trim()
     }
     if ($AllowInteractiveWizard) {
-        if (-not $e.Enabled -or [string]::IsNullOrWhiteSpace($e.PasswordProtectedBase64)) {
+        $needsFirstTimeWizard = (-not $e.Enabled) -or [string]::IsNullOrWhiteSpace($e.PasswordProtectedBase64)
+        if ($needsFirstTimeWizard) {
             $ask = Read-Host 'Set up SMTP email notifications (saved to config)? [y/N]'
+            if ($ask -match '^(y|yes)$') {
+                $e = Invoke-ArchiveEmailFirstTimeSetup -Seed $e
+            }
         }
         else {
             $ask = Read-Host 'Change SMTP email settings? [y/N]'
-        }
-        if ($ask -match '^(y|yes)$') {
-            $e = Invoke-ArchiveEmailSetupWizard -Seed $e
+            if ($ask -match '^(y|yes)$') {
+                $e = Invoke-ArchiveEmailInteractiveChange -Seed $e
+            }
         }
     }
     if ($e.Enabled) {
@@ -882,7 +1067,7 @@ function Test-SingleConfigValidity {
     }
     elseif (-not (Test-Path -LiteralPath $ArchivePath)) {
         if (-not $DoCommit) {
-            $issues += @{ Field = 'ArchivePath'; Message = 'ArchivePath does not exist. Create it for preview, or use -Commit to create it.' }
+            $issues += @{ Field = 'ArchivePath'; Message = 'ArchivePath does not exist. Create it for preview, or use -Commit/-test to create it.' }
         }
     }
 
@@ -978,6 +1163,71 @@ function Get-UniqueDestinationFilePath {
         }
         $n++
     }
+}
+
+function ConvertTo-ExcludedFullPaths {
+    param(
+        [string[]]$ExcludeFolderEntries,
+        [string]$InputResolved
+    )
+    $list = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $ExcludeFolderEntries) {
+        return @()
+    }
+    foreach ($raw in $ExcludeFolderEntries) {
+        if ($null -eq $raw) { continue }
+        $s = [string]$raw
+        $s = $s.Trim()
+        if ([string]::IsNullOrWhiteSpace($s)) { continue }
+        $s = $s.Trim('"').Trim("'")
+        $s = $s.TrimEnd('\', '/')
+        if ([string]::IsNullOrWhiteSpace($s)) { continue }
+
+        # Absolute path: D:\... or \\server\share\...
+        if ($s -match '^[A-Za-z]:\\' -or $s -match '^\\\\') {
+            $full = $s
+        }
+        else {
+            # Treat as relative to InputPath (so you can enter SubfolderName).
+            $rel = $s.TrimStart('\', '/')
+            if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+            $full = Join-Path $InputResolved $rel
+        }
+        $full = $full.TrimEnd('\')
+        if (-not [string]::IsNullOrWhiteSpace($full)) {
+            $null = $list.Add($full)
+        }
+    }
+
+    # De-duplicate case-insensitively while preserving first-seen values.
+    $seen = @{}
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $list) {
+        $k = $p.ToLowerInvariant()
+        if (-not $seen.ContainsKey($k)) {
+            $seen[$k] = $true
+            $null = $out.Add($p)
+        }
+    }
+    return @($out.ToArray())
+}
+
+function Test-PathIsUnderExcludedFolder {
+    param(
+        [string]$SourcePath,
+        [string[]]$ExcludedFullPaths
+    )
+    if ($null -eq $ExcludedFullPaths -or $ExcludedFullPaths.Count -eq 0) {
+        return $false
+    }
+    $sp = $SourcePath.TrimEnd('\')
+    foreach ($ef in $ExcludedFullPaths) {
+        $pref = $ef.TrimEnd('\') + '\'
+        if ($sp.StartsWith($pref, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-RelativePathFromRoot {
@@ -1230,6 +1480,7 @@ function Write-ArchiveHtmlReport {
         [string]$AgeBasis,
         [datetime]$Cutoff,
         [bool]$Commit,
+        [bool]$TestCopy,
         [string]$ScriptVersion,
         [int]$FileScanCount,
         [int]$SkippedTooNew,
@@ -1241,7 +1492,15 @@ function Write-ArchiveHtmlReport {
     )
 
     $genAt = (Get-Date).ToString('F')
-    $modeLabel = if ($Commit) { 'Commit (moves performed where successful)' } else { 'Preview (no moves)' }
+    if ($Commit) {
+        $modeLabel = 'Commit (moves performed where successful)'
+    }
+    elseif ($TestCopy) {
+        $modeLabel = 'Test copy (files copied; source is not modified)'
+    }
+    else {
+        $modeLabel = 'Preview (no moves)'
+    }
     $serverName = $env:COMPUTERNAME
     if ([string]::IsNullOrWhiteSpace($serverName)) {
         $serverName = '(unknown)'
@@ -1401,7 +1660,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: now
         <dt>Scanned</dt><dd>$FileScanCount files</dd>
         <dt>Too new</dt><dd>$SkippedTooNew</dd>
         <dt>Met age rule</dt><dd>$($ResultRows.Count) total</dd>
-        <dt>Planned / moved</dt><dd>$PlannedMovedCount</dd>
+        <dt>Planned / moved / test copied</dt><dd>$PlannedMovedCount</dd>
         <dt>Failed</dt><dd>$FailedCount</dd>
         <dt>Size off source</dt><dd><strong>$(ConvertTo-HtmlEncodedText $ReclaimDisplay)</strong> ($ReclaimBytes B)</dd>
       </dl>
@@ -1444,17 +1703,21 @@ function Invoke-SingleArchiveJob {
         [double]$YearsNum,
         [string]$AgeBasisEff,
         [bool]$DoCommit,
+        [bool]$DoTestCopy,
         [string]$OutFormatIn,
         [string]$ShareNameLabel = '',
         [bool]$BoundRemoveEmptyFolders = $false,
         [string]$RemoveEmptyFoldersParam = '',
-        [string]$RemoveEmptyPref = ''
+        [string]$RemoveEmptyPref = '',
+        [string[]]$ExcludedFolderEntries = @()
     )
 
     $inputResolved = $InputResolved.TrimEnd('\')
     $archiveResolved = $ArchiveResolved.TrimEnd('\')
+    $archiveTargetRoot = Get-ArchiveDestinationRootForInput -ArchiveResolved $archiveResolved -InputResolved $inputResolved -ShareNameLabel $ShareNameLabel
     $ageBasisEffective = $AgeBasisEff
     $doCommit = $DoCommit
+    $doTestCopy = $DoTestCopy
     $yrs = $YearsNum
 
     $cutoff = (Get-Date).AddYears(-$yrs)
@@ -1462,11 +1725,12 @@ function Invoke-SingleArchiveJob {
     Write-Host '========== ARCHIVE RUN ==========' -ForegroundColor Cyan
     Write-Host ('  Source tree (InputPath):  {0}' -f $inputResolved)
     Write-Host ('  Archive root:             {0}' -f $archiveResolved)
+    Write-Host ('  Destination base:         {0}' -f $archiveTargetRoot)
     Write-Host ('  Age rule: older than {0} year(s); using {1} (must be strictly before {2}).' -f $yrs, $ageBasisEffective, $cutoff)
     if ($ageBasisEffective -eq 'LastAccessTime') {
         Write-Host '  Note: LastAccessTime depends on NTFS last-access tracking; if the volume disables it, dates may look stale.' -ForegroundColor DarkGray
     }
-    Write-Host ('  Mode: {0}' -f $(if ($doCommit) { 'COMMIT - files will be moved to the archive' } else { 'PREVIEW - no moves; plan only' }))
+    Write-Host ('  Mode: {0}' -f $(if ($doCommit) { 'COMMIT - files will be moved to the archive' } elseif ($doTestCopy) { 'TEST - files will be copied to the archive (source not modified)' } else { 'PREVIEW - no copies or moves; plan only' }))
     Write-Host '=================================' -ForegroundColor Cyan
     Write-Host ''
 
@@ -1489,6 +1753,8 @@ function Invoke-SingleArchiveJob {
 
     $results = New-Object System.Collections.Generic.List[object]
 
+    $excludedFullPaths = ConvertTo-ExcludedFullPaths -ExcludeFolderEntries $ExcludedFolderEntries -InputResolved $inputResolved
+
     $files = @(
         Get-ChildItem -LiteralPath $inputResolved -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable gciErrors
     )
@@ -1496,6 +1762,10 @@ function Invoke-SingleArchiveJob {
     $gciErrCount = 0
     if ($null -ne $gciErrors) {
         $gciErrCount = @($gciErrors).Count
+    }
+
+    if ($excludedFullPaths.Count -gt 0) {
+        $files = @($files | Where-Object { -not (Test-PathIsUnderExcludedFolder -SourcePath $_.FullName -ExcludedFullPaths $excludedFullPaths) })
     }
     if ($gciErrCount -gt 0) {
         Write-Host ""
@@ -1548,10 +1818,17 @@ function Invoke-SingleArchiveJob {
             }
 
             $relative = Get-RelativePathFromRoot -FileFullName $sourcePath -RootFullName $inputResolved
-            $initialDest = Join-Path $archiveResolved $relative
-            $destPath = Get-UniqueDestinationFilePath -InitialDestPath $initialDest
+            $initialDest = Join-Path $archiveTargetRoot $relative
+            if (-not $doCommit -and -not $doTestCopy) {
+                # Preview mode reports what would be written, without overwriting existing files.
+                $destPath = Get-UniqueDestinationFilePath -InitialDestPath $initialDest
+            }
+            else {
+                # Test-copy and commit should write to the same destination so the final commit does not create duplicates.
+                $destPath = $initialDest
+            }
 
-            if (-not $doCommit) {
+            if (-not $doCommit -and -not $doTestCopy) {
                 $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
                 $results.Add([pscustomobject]@{
                         SourcePath       = $sourcePath
@@ -1573,18 +1850,34 @@ function Invoke-SingleArchiveJob {
             }
 
             $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
-            Move-Item -LiteralPath $sourcePath -Destination $destPath -Force -ErrorAction Stop
-            $results.Add([pscustomobject]@{
-                    SourcePath       = $sourcePath
-                    DestinationPath  = $destPath
-                    ComparedForAge   = $comparedForAge
-                    LastWriteTime    = $file.LastWriteTime
-                    CreationTime     = $file.CreationTime
-                    Length           = $file.Length
-                    Owner            = $ownerSnap
-                    Status           = 'Moved'
-                    Message          = ''
-                })
+            if ($doTestCopy -and -not $doCommit) {
+                Copy-Item -LiteralPath $sourcePath -Destination $destPath -Force -ErrorAction Stop
+                $results.Add([pscustomobject]@{
+                        SourcePath       = $sourcePath
+                        DestinationPath  = $destPath
+                        ComparedForAge   = $comparedForAge
+                        LastWriteTime    = $file.LastWriteTime
+                        CreationTime     = $file.CreationTime
+                        Length           = $file.Length
+                        Owner            = $ownerSnap
+                        Status           = 'TestCopied'
+                        Message          = ''
+                    })
+            }
+            else {
+                Move-Item -LiteralPath $sourcePath -Destination $destPath -Force -ErrorAction Stop
+                $results.Add([pscustomobject]@{
+                        SourcePath       = $sourcePath
+                        DestinationPath  = $destPath
+                        ComparedForAge   = $comparedForAge
+                        LastWriteTime    = $file.LastWriteTime
+                        CreationTime     = $file.CreationTime
+                        Length           = $file.Length
+                        Owner            = $ownerSnap
+                        Status           = 'Moved'
+                        Message          = ''
+                    })
+            }
         }
         catch {
             $ownerSnap = Get-FileOwnerForReport -LiteralPath $sourcePath
@@ -1603,12 +1896,15 @@ function Invoke-SingleArchiveJob {
         }
     }
 
-    $plannedMovedRows = @($results | Where-Object { $_.Status -in 'Planned', 'Moved' })
+    $plannedMovedRows = @($results | Where-Object { $_.Status -in 'Planned', 'Moved', 'TestCopied' })
+    $movedRows = @($results | Where-Object { $_.Status -eq 'Moved' })
     $failedRows = @($results | Where-Object { $_.Status -eq 'Failed' })
     $reclaimBytes = [long]0
-    $sumObj = $plannedMovedRows | Measure-Object -Property Length -Sum
-    if ($null -ne $sumObj -and $null -ne $sumObj.Sum) {
-        $reclaimBytes = [long]$sumObj.Sum
+    if ($doCommit) {
+        $sumObj = $movedRows | Measure-Object -Property Length -Sum
+        if ($null -ne $sumObj -and $null -ne $sumObj.Sum) {
+            $reclaimBytes = [long]$sumObj.Sum
+        }
     }
     $reclaimDisplay = Format-DataSize -Bytes $reclaimBytes
 
@@ -1616,9 +1912,14 @@ function Invoke-SingleArchiveJob {
     Write-Host '--- Step 4: Age filter summary ---' -ForegroundColor DarkGray
     Write-Host ("  Files skipped (too new, on or after cutoff): {0}" -f $skippedTooNew) -ForegroundColor DarkGray
     Write-Host ("  Files listed for archive (met age rule):     {0}" -f $results.Count) -ForegroundColor DarkGray
-    Write-Host ("    - Planned or Moved (success path):         {0}" -f $plannedMovedRows.Count) -ForegroundColor DarkGray
+    Write-Host ("    - Planned / moved / test-copied:         {0}" -f $plannedMovedRows.Count) -ForegroundColor DarkGray
     Write-Host ("    - Failed (met age but error on move/plan): {0}" -f $failedRows.Count) -ForegroundColor DarkGray
-    Write-Host ("  Total size of Planned+Moved (space no longer on source after a successful move): {0} ({1} bytes)" -f $reclaimDisplay, $reclaimBytes) -ForegroundColor DarkGray
+    if ($doCommit) {
+        Write-Host ("  Total size of moved files (space no longer on source after success): {0} ({1} bytes)" -f $reclaimDisplay, $reclaimBytes) -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host ("  Total size moved from source:            {0} ({1} bytes)" -f $reclaimDisplay, $reclaimBytes) -ForegroundColor DarkGray
+    }
     Write-Host ''
 
     $removeEmptyChoice = $null
@@ -1643,6 +1944,9 @@ function Invoke-SingleArchiveJob {
             )
             foreach ($dir in $dirs) {
                 if ($dir.FullName.TrimEnd('\') -eq $inputResolved.TrimEnd('\')) {
+                    continue
+                }
+                if (Test-PathIsUnderExcludedFolder -SourcePath $dir.FullName -ExcludedFullPaths $excludedFullPaths) {
                     continue
                 }
                 try {
@@ -1679,6 +1983,13 @@ function Invoke-SingleArchiveJob {
     }
 
     $htmlReportOutPath = $null
+    $domainForReport = Get-ReportDomainLabelForFilename
+    $htmlBaseName = Get-ArchiveHtmlReportFilename -DomainPart $domainForReport -InputResolved $inputResolved -ShareNameLabel $ShareNameLabel
+    $htmlReportOutPath = Join-Path $script:ScriptHome $htmlBaseName
+    Write-ArchiveHtmlReport -LiteralPath $htmlReportOutPath -ResultRows $results -InputResolved $inputResolved -ArchiveResolved $archiveResolved `
+        -Years $yrs -AgeBasis $ageBasisEffective -Cutoff $cutoff -Commit $doCommit -TestCopy $doTestCopy -ScriptVersion $script:Version `
+        -FileScanCount $fileScanCount -SkippedTooNew $skippedTooNew -PlannedMovedCount $plannedMovedRows.Count -FailedCount $failedRows.Count `
+        -ReclaimBytes $reclaimBytes -ReclaimDisplay $reclaimDisplay -DomainLabel $domainForReport
     if ($outFormat -eq 'Text') {
         Write-Host ''
         Write-Host '========== DETAIL: FILES THAT MET THE AGE RULE ==========' -ForegroundColor Cyan
@@ -1689,15 +2000,11 @@ function Invoke-SingleArchiveJob {
             $results | Format-Table -AutoSize -Property SourcePath, Owner, ComparedForAge, LastWriteTime, Length, Status, Message
         }
         Write-Host '=========================================================' -ForegroundColor Cyan
+        Write-Host ''
+        Write-Host "HTML report saved: $htmlReportOutPath" -ForegroundColor Cyan
+        Write-Host ("  Rows (met age rule): {0}" -f $results.Count) -ForegroundColor DarkGray
     }
     else {
-        $domainForReport = Get-ReportDomainLabelForFilename
-        $htmlBaseName = Get-ArchiveHtmlReportFilename -DomainPart $domainForReport -InputResolved $inputResolved -ShareNameLabel $ShareNameLabel
-        $htmlReportOutPath = Join-Path $archiveResolved $htmlBaseName
-        Write-ArchiveHtmlReport -LiteralPath $htmlReportOutPath -ResultRows $results -InputResolved $inputResolved -ArchiveResolved $archiveResolved `
-            -Years $yrs -AgeBasis $ageBasisEffective -Cutoff $cutoff -Commit $doCommit -ScriptVersion $script:Version `
-            -FileScanCount $fileScanCount -SkippedTooNew $skippedTooNew -PlannedMovedCount $plannedMovedRows.Count -FailedCount $failedRows.Count `
-            -ReclaimBytes $reclaimBytes -ReclaimDisplay $reclaimDisplay -DomainLabel $domainForReport
         Write-Host ''
         Write-Host "HTML report written: $htmlReportOutPath" -ForegroundColor Cyan
         Write-Host ("  Rows (met age rule): {0}" -f $results.Count) -ForegroundColor DarkGray
@@ -1712,7 +2019,7 @@ function Invoke-SingleArchiveJob {
     Write-Host ('  ArchivePath (resolved):  {0}' -f $archiveResolved)
     Write-Host ('  Years / AgeBasis:        {0} / {1}' -f $yrs, $ageBasisEffective)
     Write-Host ('  Cutoff (exclusive):      {0}' -f $cutoff)
-    Write-Host ('  Mode:                    {0}' -f $(if ($doCommit) { 'Commit (moves performed where successful)' } else { 'Preview (no moves)' }))
+    Write-Host ('  Mode:                    {0}' -f $(if ($doCommit) { 'Commit (moves performed where successful)' } elseif ($doTestCopy) { 'Test copy (files copied; source not modified)' } else { 'Preview (no copies or moves)' }))
     Write-Host ('  Output format this run:  {0}' -f $outFormat)
     if ($outFormat -eq 'HTML' -and $null -ne $htmlReportOutPath) {
         Write-Host ('  HTML report path:        {0}' -f $htmlReportOutPath)
@@ -1720,10 +2027,16 @@ function Invoke-SingleArchiveJob {
     Write-Host ('  Files scanned (all ages): {0}' -f $fileScanCount)
     Write-Host ('  Skipped (too new):        {0}' -f $skippedTooNew)
     Write-Host ('  Listed (met age rule):    {0}' -f $results.Count)
-    Write-Host ('    Planned + Moved:        {0}' -f $plannedMovedRows.Count)
+    Write-Host ('    Planned / moved / test-copied: {0}' -f $plannedMovedRows.Count)
     Write-Host ('    Failed:                 {0}' -f $failedRows.Count)
-    Write-Host ('  Source space from Planned+Moved: {0} ({1} bytes)' -f $reclaimDisplay, $reclaimBytes)
-    Write-Host '    (After commit, this much file data no longer lives under the source tree.)' -ForegroundColor DarkGray
+    if ($doCommit) {
+        Write-Host ('  Source space from moved files: {0} ({1} bytes)' -f $reclaimDisplay, $reclaimBytes)
+        Write-Host '    (After commit, this much file data no longer lives under the source tree.)' -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host ('  Source space from moved files: {0} ({1} bytes)' -f $reclaimDisplay, $reclaimBytes)
+        Write-Host '    (No deletes in this mode; source files remain.)' -ForegroundColor DarkGray
+    }
     Write-Host '==============================================================================' -ForegroundColor Cyan
     Write-Host ''
 
@@ -1745,6 +2058,7 @@ function Invoke-SingleArchiveJob {
         GciErrorCount          = $gciErrCount
         FirstGciErrorLog       = $firstGciErrorLog
         DoCommitUsed           = $doCommit
+        DoTestCopyUsed        = $doTestCopy
         RemoveEmptyChoice      = $removeEmptyChoice
         Cutoff                 = $cutoff
         AgeBasisEffective      = $ageBasisEffective
@@ -1819,9 +2133,33 @@ $coreProvidedOnCli = (-not [string]::IsNullOrWhiteSpace("$ArchivePath")) -and
 $in = $InputPath
 $arch = $ArchivePath
 $doCommit = ConvertTo-BoundBool $Commit
+$doTestCopy = $testMoveFlag
 $outPref = $Output
 $removePref = $RemoveEmptyFolders
 $effectiveArchiveShareName = $ArchiveShareName
+$excludePref = @()
+if ($PSBoundParameters.ContainsKey('ExcludeFolders') -and -not [string]::IsNullOrWhiteSpace("$ExcludeFolders")) {
+    $excludePref = @($ExcludeFolders)
+    $excludeParts = New-Object System.Collections.Generic.List[string]
+    foreach ($x in $excludePref) {
+        if ($null -eq $x) { continue }
+        $sx = [string]$x
+        foreach ($p in ($sx -split '[,;]')) {
+            $t = $p.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($t)) {
+                $null = $excludeParts.Add($t)
+            }
+        }
+    }
+    $excludePref = @($excludeParts.ToArray())
+}
+
+if ($doCommit -and $doTestCopy) {
+    throw 'Cannot use -Commit and -test/TestMove at the same time.'
+}
+if ($doTestCopy) {
+    $doCommit = $false
+}
 
 if ($allSharesFlag -and -not [string]::IsNullOrWhiteSpace("$InputPath")) {
     Write-Host 'Note: -All ignores InputPath; each published disk share is scanned in preview-only mode.' -ForegroundColor Yellow
@@ -1856,6 +2194,14 @@ if ($coreProvidedOnCli) {
                 $ageBasisEffective = $resolvedAb
             }
         }
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('ExcludeFolders') -and $null -ne $savedSide -and $null -ne $savedSide.ExcludeFolders) {
+        $excludePref = @($savedSide.ExcludeFolders)
+    }
+    if (-not $PSBoundParameters.ContainsKey('TestMove') -and $null -ne $savedSide -and $null -ne $savedSide.TestMove) {
+        $doTestCopy = [bool]$savedSide.TestMove
+        if ($doTestCopy) { $doCommit = $false }
     }
 }
 else {
@@ -1922,6 +2268,13 @@ else {
         }
         if (-not $PSBoundParameters.ContainsKey('Commit') -and -not $allSharesFlag) {
             $doCommit = [bool]$saved.Commit
+        }
+        if (-not $PSBoundParameters.ContainsKey('ExcludeFolders') -and $null -ne $saved -and $null -ne $saved.ExcludeFolders) {
+            $excludePref = @($saved.ExcludeFolders)
+        }
+        if (-not $PSBoundParameters.ContainsKey('TestMove') -and $null -ne $saved -and $null -ne $saved.TestMove) {
+            $doTestCopy = [bool]$saved.TestMove
+            if ($doTestCopy) { $doCommit = $false }
         }
         if (-not ($PSBoundParameters.ContainsKey('Output') -and $Output -in 'Text', 'HTML')) {
             $normUseOut = Normalize-SavedOutputFormat -Raw $saved.Output
@@ -1994,17 +2347,48 @@ else {
                 }
             }
         }
-        if (-not $PSBoundParameters.ContainsKey('Commit') -and -not $allSharesFlag) {
-            $defC = if ($null -ne $saved) { [bool]$saved.Commit } else { $false }
-            $r = Read-Host "Run with -Commit (actually move files)? Current default [$defC] (y/N)"
-            if ($r -match '^(y|yes)$') {
-                $doCommit = $true
+        if (-not $PSBoundParameters.ContainsKey('ExcludeFolders') -and -not $allSharesFlag) {
+            $r = Read-Host 'Exclude folders under InputPath (comma/semicolon separated; blank = none)'
+            if (-not [string]::IsNullOrWhiteSpace($r)) {
+                $excludeParts = New-Object System.Collections.Generic.List[string]
+                foreach ($p in ([string]$r).Split([char[]]@(',', ';'))) {
+                    $t = $p.Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($t)) {
+                        $null = $excludeParts.Add($t)
+                    }
+                }
+                $excludePref = @($excludeParts.ToArray())
             }
-            elseif ($r -match '^(n|no)$') {
+        }
+        if (-not $PSBoundParameters.ContainsKey('Commit') -and -not $PSBoundParameters.ContainsKey('TestMove') -and -not $allSharesFlag) {
+            $defMode = 1
+            if ($null -ne $saved) {
+                if ($null -ne $saved.TestMove -and [bool]$saved.TestMove) { $defMode = 2 }
+                elseif ($null -ne $saved.Commit -and [bool]$saved.Commit) { $defMode = 3 }
+            }
+            $defCommitLocal = ($defMode -eq 3)
+            $defTestLocal = ($defMode -eq 2)
+            $prompt = "Run mode (1=Preview, 2=Test copy, 3=Commit). Current default [$defMode]"
+            $r = Read-Host $prompt
+            if ([string]::IsNullOrWhiteSpace($r)) {
+                $doCommit = $defCommitLocal
+                $doTestCopy = $defTestLocal
+            }
+            elseif ($r -match '^(2|t|test|copy)$') {
                 $doCommit = $false
+                $doTestCopy = $true
+            }
+            elseif ($r -match '^(3|y|yes|commit)$') {
+                $doCommit = $true
+                $doTestCopy = $false
+            }
+            elseif ($r -match '^(1|n|no|preview)$') {
+                $doCommit = $false
+                $doTestCopy = $false
             }
             else {
-                $doCommit = $defC
+                $doCommit = $defCommitLocal
+                $doTestCopy = $defTestLocal
             }
         }
         if (-not $PSBoundParameters.ContainsKey('Output') -and -not $allSharesFlag) {
@@ -2087,11 +2471,11 @@ $maxValidationAttempts = 25
 while ($true) {
     $validationAttempt++
     if ($validationAttempt -gt $maxValidationAttempts) {
-        Write-Error "Configuration could not be validated after $maxValidationAttempts attempts. Fix paths (or create missing folders), then re-run. For a missing archive folder only, answer yes when asked to use -Commit, or create the folder first."
+        Write-Error "Configuration could not be validated after $maxValidationAttempts attempts. Fix paths (or create missing folders), then re-run. For a missing archive folder only, answer yes when asked to use -Commit or -test, or create the folder first."
         exit 1
     }
 
-    $validateDoCommit = $doCommit -and -not $allSharesFlag
+    $validateDoCommit = ($doCommit -or $doTestCopy) -and -not $allSharesFlag
     $issues = @(Test-SingleConfigValidity -InputPath $in -ArchivePath $arch -Years $yrs -DoCommit $validateDoCommit -AllSharesMode:$allSharesFlag)
 
     if ($issues.Count -eq 0) {
@@ -2107,10 +2491,15 @@ while ($true) {
             Write-Host 'The archive folder does not exist yet. Create it manually first; -All only writes HTML reports (preview, no -Commit).' -ForegroundColor Yellow
         }
         else {
-            Write-Host 'The archive folder does not exist yet. Preview mode requires that folder to exist (or use -Commit to create it).' -ForegroundColor Yellow
-            $offerCommit = Read-Host 'Use -Commit for this run so the archive folder can be created? [y/N]'
+            Write-Host 'The archive folder does not exist yet. Preview mode requires that folder to exist (or use -Commit/-test to create it).' -ForegroundColor Yellow
+            $offerCommit = Read-Host 'Use -Commit or -test for this run so the archive folder can be created? [y/N]'
             if ($offerCommit -match '^(y|yes)$') {
-                $doCommit = $true
+                if ($doTestCopy) {
+                    # keep test mode
+                }
+                else {
+                    $doCommit = $true
+                }
                 continue
             }
         }
@@ -2189,8 +2578,24 @@ $AgeBasis = $ageBasisEffective
 
 if ($allSharesFlag) {
     $doCommit = $false
+    $doTestCopy = $false
     $Output = 'HTML'
     $outPref = 'HTML'
+}
+
+$excludePref = if ($null -eq $excludePref) { @() } else { @($excludePref) }
+if ($excludePref.Count -gt 0) {
+    $excludeNorm = New-Object System.Collections.Generic.List[string]
+    foreach ($raw in $excludePref) {
+        if ($null -eq $raw) { continue }
+        foreach ($p in ([string]$raw).Split([char[]]@(',', ';'))) {
+            $t = $p.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($t)) {
+                $null = $excludeNorm.Add($t)
+            }
+        }
+    }
+    $excludePref = @($excludeNorm.ToArray())
 }
 
 $configSnapshotForEmail = Read-SavedConfigFromDisk -Path $configFile
@@ -2209,7 +2614,7 @@ if ($allSharesFlag) {
     Write-Host '========== ALL SHARES (preview only, one HTML report per share) ==========' -ForegroundColor Cyan
     Write-Host ('  Report folder (ArchivePath): {0}' -f $ArchivePath)
     Write-Host ('  Years: {0}  AgeBasis: {1}' -f $yrs, $ageBasisEffective)
-    Write-Host '  -Commit, saved Commit, and prompts are ignored for moves; no files are moved.'
+    Write-Host '  -Commit/-test, saved modes, and prompts are ignored for moves/copies; no files are moved or copied.'
     Write-Host '==========================================================================' -ForegroundColor Cyan
     Write-Host ''
 
@@ -2244,8 +2649,8 @@ if ($allSharesFlag) {
         }
         try {
             $j = Invoke-SingleArchiveJob -InputResolved $shareRoot -ArchiveResolved $archiveResolved -YearsNum $yrs `
-                -AgeBasisEff $ageBasisEffective -DoCommit $false -OutFormatIn 'HTML' -ShareNameLabel $sh.Name `
-                -BoundRemoveEmptyFolders $false -RemoveEmptyFoldersParam '' -RemoveEmptyPref ''
+                -AgeBasisEff $ageBasisEffective -DoCommit $false -DoTestCopy $false -OutFormatIn 'HTML' -ShareNameLabel $sh.Name `
+                -BoundRemoveEmptyFolders $false -RemoveEmptyFoldersParam '' -RemoveEmptyPref '' -ExcludedFolderEntries $excludePref
             $null = $shareJobs.Add($j)
             if ($null -ne $j.HtmlReportPath -and $j.HtmlReportPath -ne '') {
                 $null = $allHtmlPaths.Add($j.HtmlReportPath)
@@ -2310,11 +2715,11 @@ else {
 
     try {
         if (-not (Test-Path -LiteralPath $ArchivePath)) {
-            if ($doCommit) {
+            if ($doCommit -or $doTestCopy) {
                 $null = New-Item -ItemType Directory -Path $ArchivePath -Force -ErrorAction Stop
             }
             else {
-                throw "ArchivePath does not exist. Create the folder first for preview mode, or use -Commit to create it."
+                throw "ArchivePath does not exist. Create the folder first for preview mode, or use -Commit/-test to create it."
             }
         }
         $archiveResolved = (Get-Item -LiteralPath $ArchivePath).FullName.TrimEnd('\')
@@ -2334,15 +2739,15 @@ else {
     $rpStr = if ($null -ne $removePref) { [string]$removePref } else { '' }
 
     $job = Invoke-SingleArchiveJob -InputResolved $inputResolved -ArchiveResolved $archiveResolved -YearsNum $yrs `
-        -AgeBasisEff $ageBasisEffective -DoCommit $doCommit -OutFormatIn "$Output" -ShareNameLabel '' `
-        -BoundRemoveEmptyFolders $rbRm -RemoveEmptyFoldersParam $rmVal -RemoveEmptyPref $rpStr
+        -AgeBasisEff $ageBasisEffective -DoCommit $doCommit -DoTestCopy $doTestCopy -OutFormatIn "$Output" -ShareNameLabel '' `
+        -BoundRemoveEmptyFolders $rbRm -RemoveEmptyFoldersParam $rmVal -RemoveEmptyPref $rpStr -ExcludedFolderEntries $excludePref
 
     $inputResolved = $job.InputResolved
     $archiveResolved = $job.ArchiveResolved
     $results = $job.Results
     $fileScanCount = $job.FileScanCount
     $skippedTooNew = $job.SkippedTooNew
-    $plannedMovedRows = @($results | Where-Object { $_.Status -in 'Planned', 'Moved' })
+    $plannedMovedRows = @($results | Where-Object { $_.Status -in 'Planned', 'Moved', 'TestCopied' })
     $failedRows = @($results | Where-Object { $_.Status -eq 'Failed' })
     $reclaimBytes = $job.ReclaimBytes
     $reclaimDisplay = $job.ReclaimDisplay
@@ -2360,7 +2765,7 @@ else {
 if (-not $noSaveConfigFlag) {
     try {
         $payload = [ordered]@{
-            SchemaVersion      = 2
+            SchemaVersion      = 3
             ScriptVersion      = $script:Version
             SavedAt            = (Get-Date).ToString('o')
             InputPath          = $InputPath
@@ -2369,6 +2774,8 @@ if (-not $noSaveConfigFlag) {
             Years              = $yrs
             AgeBasis           = $ageBasisEffective
             Commit             = [bool]$doCommit
+            TestMove           = [bool]$doTestCopy
+            ExcludeFolders     = @($excludePref)
             Output             = $outFormat
             RemoveEmptyFolders = $(if ($null -ne $removeEmptyChoice) { $removeEmptyChoice } else { $null })
             AllShares          = [bool]$allSharesFlag
@@ -2455,7 +2862,7 @@ if (-not $noSendEmailFlag -and $ArchiveEmailRuntime['Enabled']) {
     try {
         $domainLbl = Get-ReportDomainLabelForFilename
         $scanLbl = Get-ArchiveEmailScanLabel -InputResolved $inputResolved -AllSharesMode $allSharesFlag
-        $subj = Get-ArchiveEmailAutoSubject -DomainLabel $domainLbl -ScanLabel $scanLbl -CommitMode $doCommit
+        $subj = Get-ArchiveEmailAutoSubject -DomainLabel $domainLbl -ScanLabel $scanLbl -CommitMode $doCommit -TestCopyMode $doTestCopy
         $attachList = New-Object System.Collections.Generic.List[string]
         if ($allSharesFlag) {
             foreach ($hp in $allHtmlPaths) {
@@ -2464,7 +2871,7 @@ if (-not $noSendEmailFlag -and $ArchiveEmailRuntime['Enabled']) {
                 }
             }
         }
-        elseif ($outFormat -eq 'HTML' -and -not [string]::IsNullOrWhiteSpace($htmlReportOutPath) -and (Test-Path -LiteralPath $htmlReportOutPath)) {
+        elseif (-not [string]::IsNullOrWhiteSpace($htmlReportOutPath) -and (Test-Path -LiteralPath $htmlReportOutPath)) {
             $null = $attachList.Add($htmlReportOutPath)
         }
         $listedSum = if ($allSharesFlag) { $listedForArchiveAll } else { @($results).Count }
@@ -2479,8 +2886,8 @@ if (-not $noSendEmailFlag -and $ArchiveEmailRuntime['Enabled']) {
             "Years: $yrs  AgeBasis: $ageBasisEffective  Output: $outFormat  Commit: $doCommit",
             "Files scanned (all ages): $fileScanCount",
             "Met age rule (listed): $listedSum",
-            "Planned+Moved: $pmSum  Failed: $fSum",
-            "Reclaim (Planned+Moved): $reclaimDisplay"
+            "Planned/Moved/TestCopied: $pmSum  Failed: $fSum",
+            "Reclaim (moved only): $reclaimDisplay"
         )
         if ($attachList.Count -eq 0) {
             $bodyLines += '(No HTML file attached for this run.)'

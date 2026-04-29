@@ -18,6 +18,10 @@ On a **file server**, when you are prompted for paths (not when all paths are pa
 
 **`-All`** runs a **preview-only** pass over **every** published disk share (same filter as the picker: Type 0, no trailing `$` in the name). **`-Commit` is ignored** (no moves). Pass **`ArchivePath`** and **`Years`** (or use saved config); **HTML** reports are written **one file per share** under the archive folder. Shares whose path **contains** the archive folder are skipped.
 
+**`-ExcludeFolders`** lets you exclude one or more folders (relative to `InputPath` or as full paths) from both the scan and any copy/move actions; the list is saved to `Archive-OldFiles.config.json`.
+
+**`-test` / `-TestMove`** enables a **copy-only** test mode: the script copies files that meet the age rule into the archive (mirroring structure) but does not delete from the source. This mode is saved to JSON as `TestMove`.
+
 Age is judged by **last write time** by default (Explorer “Date modified”). You can use **`-AgeBasis LastAccessTime`** (last opened / NTFS last access; note that last-access updates can be disabled on a volume), **`-AgeBasis LatestWriteOrAccess`** (newer of modified and last access—only archives when both are older than the cutoff), **`-AgeBasis CreationTime`**, or **`-AgeBasis Earliest`** (older of creation vs last write, useful after copies/restores). Aliases include **Modified**, **Opened**, **ModifiedOrOpened**, and **A** / **B** / **C**. Enumeration uses **`-Force`** so hidden/system files are included.
 
 In reports, owners that are unresolved SIDs or deleted accounts show as **No active user**.
