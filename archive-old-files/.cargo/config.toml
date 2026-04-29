@@ -1,0 +1,6 @@
+# Cross-compile to Windows MSVC using cargo-xwin (see README / setup-cross-compile.sh).
+# cargo-xwin sets linker env vars when you run: cargo xwin build --target x86_64-pc-windows-msvc
+
+[build]
+# Uncomment if you use a manual lld-link + xwin layout (cargo xwin usually handles this):
+# rustflags = ["-C", "link-arg=/NODEFAULTLIB:libcmt"]
